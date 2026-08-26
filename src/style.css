@@ -139,4 +139,53 @@ body {
   cursor: grab; touch-action: none;
 }
 .dag-hscroll-box.dragging { cursor: grabbing; background: rgba(245, 179, 1, 0.5); }
+
+.dag-bank-badge {
+  position: absolute; bottom: 5px; right: 6px; display: none;
+  font-size: 10px; font-weight: 800; letter-spacing: .5px;
+  padding: 0 3px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.72); pointer-events: none;
+}
+.dag-bank-badge.a { color: rgb(38, 126, 54); }
+.dag-bank-badge.d { color: rgb(179, 39, 39); }
+
+.dag-statusbar .dag-bankbtn {
+  width: 28px; height: 28px; border-radius: 8px; cursor: pointer;
+  border: 1px solid #3a4a5c; background: #223143; color: #e8eef5;
+  font-weight: 700; font-size: 14px; font-family: inherit;
+}
+.dag-statusbar .dag-bankbtn.off { color: #4c5866; background: #131c26; border-color: #202c3a; }
+.dag-statusbar .dag-bankbtn.conflict { text-decoration: line-through; text-decoration-thickness: 2px; }
+
+.dag-nodebox {
+  display: none;
+  position: relative;
+  max-width: 1100px; margin: 20px auto 130px;
+  background: rgba(20, 28, 38, 0.92); color: #e8eef5;
+  border-radius: 12px; padding: 14px 16px;
+  box-shadow: 0 8px 24px -8px #0009;
+}
+.dag-nodebox.open { display: block; }
+.dag-nodebox-title, .dag-nodebox-body {
+  display: block; width: 100%; box-sizing: border-box;
+  background: #182430; color: #e8eef5; border: 1px solid #2a3a4c; border-radius: 8px;
+  font-family: inherit; font-size: 13px; padding: 8px 10px; margin-top: 8px;
+}
+.dag-nodebox-body { resize: vertical; min-height: 60px; }
+.dag-nodebox-hint { margin-top: 8px; font-size: 11px; color: #90a0b2; }
+.dag-nodebox-flag {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 26px; display: none;
+}
+.dag-nodebox-flag.on { display: block; }
+.dag-nodebox-flag::before, .dag-nodebox-flag::after {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 2px;
+}
+.dag-nodebox-flag.a { left: -8px; }
+.dag-nodebox-flag.a::before { left: 0; background: rgb(47, 158, 68); }
+.dag-nodebox-flag.a::after { left: 4px; background: rgb(47, 158, 68); }
+.dag-nodebox-flag.d { right: -8px; }
+.dag-nodebox-flag.d::before { left: 0; background: rgb(224, 49, 49); }
+.dag-nodebox-flag.d::after { left: 4px; background: rgb(224, 49, 49); }
+
 #err { color: #ff8a8a; font-family: ui-monospace, monospace; white-space: pre-wrap; padding: 12px; }

@@ -210,14 +210,16 @@ function render(container: HTMLElement, g: GraphDef): void {
   svg.innerHTML = "<defs>" + markers + rankHatch + "</defs>";
   container.appendChild(svg);
 
-  // --- Column backgrounds + rank labels, sized to the full graph's rank count
-  // (a focused subgraph can only ever need fewer, never more). -----------------
-  const fullRankMap = computeRanks(g);
-  const maxRank0 = Math.max(...g.nodes.map(n => fullRankMap.get(n.id)!));
+  // --- Column backgrounds + rank labels, sized to the full graph's rank count.
+  // A focused subgraph can only ever need fewer; adding a node can only ever
+  // need more — growRankPools() (below, near the scrollbar) extends the pool
+  // when that happens, reusing addRankSlot(). -----------------------------
+  const fullRankMap0 = computeRanks(g);
+  let maxRank0 = Math.max(...g.nodes.map(n => fullRankMap0.get(n.id)!));
 
   const colRects: { el: SVGElement; rank: number; parity: number }[] = [];
   const rankLabels: HTMLDivElement[] = [];
-  for (let r = 0; r <= maxRank0; r++) {
+  function addRankSlot(r: number): void {
     const rect = document.createElementNS(SVG, "rect");
     rect.setAttribute("x", String(colX(r)));
     rect.setAttribute("y", String(LABEL_BAND - 6));
@@ -239,91 +241,102 @@ function render(container: HTMLElement, g: GraphDef): void {
     });
     rankLabels.push(label);
   }
+  for (let r = 0; r <= maxRank0; r++) addRankSlot(r);
 
   // --- Edge colouring: <=4 hues, keep shared-endpoint edges distinct ---------
-  const E = g.edges;
-  const conflict: number[][] = E.map(() => []);
-  for (let i = 0; i < E.length; i++)
-    for (let j = i + 1; j < E.length; j++)
-      if (E[i].from === E[j].from || E[i].to === E[j].to) {
-        conflict[i].push(j); conflict[j].push(i);
+  // Rebuilt from scratch on demand (addNode) — simplest way to keep colouring
+  // consistent as edges are added, and cheap at this scale.
+  const edgeRecs: { from: string; to: string; el: SVGElement }[] = [];
+  function rebuildEdgeRecs(): void {
+    edgeRecs.forEach(r => r.el.remove());
+    edgeRecs.length = 0;
+    const E = g.edges;
+    const conflict: number[][] = E.map(() => []);
+    for (let i = 0; i < E.length; i++)
+      for (let j = i + 1; j < E.length; j++)
+        if (E[i].from === E[j].from || E[i].to === E[j].to) {
+          conflict[i].push(j); conflict[j].push(i);
+        }
+    const K = PALETTE.length;
+    const edgeColor = new Array<number>(E.length).fill(0);
+    const orderByDeg = E.map((_, i) => i).sort((a, b) => conflict[b].length - conflict[a].length);
+    const pickLeastUsed = (i: number): number => {
+      const used = new Array<number>(K).fill(0);
+      for (const j of conflict[i]) used[edgeColor[j]]++;
+      let best = 0;
+      for (let c = 1; c < K; c++) if (used[c] < used[best]) best = c;
+      return best;
+    };
+    for (const i of orderByDeg) edgeColor[i] = pickLeastUsed(i);
+    for (let pass = 0; pass < 200; pass++) {
+      let improved = false;
+      for (let i = 0; i < E.length; i++) {
+        const before = (() => { let s = 0; for (const j of conflict[i]) if (edgeColor[j] === edgeColor[i]) s++; return s; })();
+        const cand = pickLeastUsed(i);
+        let after = 0; for (const j of conflict[i]) if (edgeColor[j] === cand) after++;
+        if (after < before) { edgeColor[i] = cand; improved = true; }
       }
-  const K = PALETTE.length;
-  const edgeColor = new Array<number>(E.length).fill(0);
-  const orderByDeg = E.map((_, i) => i).sort((a, b) => conflict[b].length - conflict[a].length);
-  const pickLeastUsed = (i: number): number => {
-    const used = new Array<number>(K).fill(0);
-    for (const j of conflict[i]) used[edgeColor[j]]++;
-    let best = 0;
-    for (let c = 1; c < K; c++) if (used[c] < used[best]) best = c;
-    return best;
-  };
-  for (const i of orderByDeg) edgeColor[i] = pickLeastUsed(i);
-  for (let pass = 0; pass < 200; pass++) {
-    let improved = false;
-    for (let i = 0; i < E.length; i++) {
-      const before = (() => { let s = 0; for (const j of conflict[i]) if (edgeColor[j] === edgeColor[i]) s++; return s; })();
-      const cand = pickLeastUsed(i);
-      let after = 0; for (const j of conflict[i]) if (edgeColor[j] === cand) after++;
-      if (after < before) { edgeColor[i] = cand; improved = true; }
+      if (!improved) break;
     }
-    if (!improved) break;
+    E.forEach((e, i) => {
+      const path = document.createElementNS(SVG, "path");
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", PALETTE[edgeColor[i]]);
+      path.setAttribute("stroke-width", "2");
+      path.setAttribute("stroke-linecap", "round");
+      path.setAttribute("marker-end", `url(#arrow-${edgeColor[i]})`);
+      svg.appendChild(path);   // appended last -> always in front of rank rects
+      edgeRecs.push({ from: e.from, to: e.to, el: path });
+    });
   }
-  const edgeRecs = g.edges.map((e, i) => {
-    const path = document.createElementNS(SVG, "path");
-    path.setAttribute("fill", "none");
-    path.setAttribute("stroke", PALETTE[edgeColor[i]]);
-    path.setAttribute("stroke-width", "2");
-    path.setAttribute("stroke-linecap", "round");
-    path.setAttribute("marker-end", `url(#arrow-${edgeColor[i]})`);
-    svg.appendChild(path);
-    return { from: e.from, to: e.to, el: path };
-  });
+  rebuildEdgeRecs();
 
   // --- Node cards: build + MEASURE their content-driven heights --------------
-  const measureLayer = document.createElement("div");
-  measureLayer.style.cssText = "position:absolute;visibility:hidden;left:-9999px;top:0;";
-  container.appendChild(measureLayer);
-
+  // Each node also gets a lineage tally (top-right, inside), an enumeration
+  // digit (top-right, outside), and a bank badge (bottom-right, inside) — all
+  // absolutely positioned so toggling them never reflows anything. addNodeCard
+  // is reused later (addNode) to bring a freshly-created node into being.
   const nodes = new Map<string, LaidNode>();
-  g.nodes.forEach(def => {
-    const el = makeNodeEl(def);
-    el.style.width = NODE_W + "px";
-    measureLayer.appendChild(el);
-    nodes.set(def.id, {
-      def, rank: 0, orderInRank: 0,
-      el, width: NODE_W, height: 0, x: 0, y: 0,
-    });
-  });
-  nodes.forEach(ln => { ln.height = ln.el.offsetHeight; });
-
-  // Each node gets an (initially hidden) top-right tally element (inside the
-  // box) and an enumeration digit element (just outside), both absolutely
-  // positioned so toggling them never reflows anything.
   const nodeTally = new Map<string, HTMLDivElement>();
   const nodeEnum = new Map<string, HTMLDivElement>();
-  nodes.forEach(ln => {
-    ln.el.style.width = NODE_W + "px";
-    ln.el.style.visibility = "visible";
-    ln.el.style.cursor = "pointer";
+  const nodeBank = new Map<string, HTMLDivElement>();
+
+  function addNodeCard(def: NodeDef): LaidNode {
+    const el = makeNodeEl(def);
+    el.style.width = NODE_W + "px";
+    el.style.left = "-9999px"; el.style.top = "0"; el.style.visibility = "hidden";
+    container.appendChild(el);   // .dag-node is already position:absolute; measure off-screen
+    const height = el.offsetHeight;
+    el.style.visibility = "visible"; el.style.cursor = "pointer";
+
+    const ln: LaidNode = { def, rank: 0, orderInRank: 0, el, width: NODE_W, height, x: 0, y: 0 };
+    nodes.set(def.id, ln);
+
     const tally = document.createElement("div");
     tally.className = "dag-tally";
-    ln.el.appendChild(tally);
-    nodeTally.set(ln.def.id, tally);
-    container.appendChild(ln.el);   // moves it out of measureLayer, on top of the svg/labels
+    el.appendChild(tally);
+    nodeTally.set(def.id, tally);
+
+    const bank = document.createElement("div");
+    bank.className = "dag-bank-badge";
+    el.appendChild(bank);
+    nodeBank.set(def.id, bank);
 
     const en = document.createElement("div");
     en.className = "dag-enum";
     container.appendChild(en);
-    nodeEnum.set(ln.def.id, en);
-  });
-  measureLayer.remove();
+    nodeEnum.set(def.id, en);
 
-  // --- Graph relations — invariant under focus, always the full graph -------
+    wireNode(ln);
+    return ln;
+  }
+  g.nodes.forEach(def => addNodeCard(def));
+
+  // --- Graph relations — recomputed whenever the graph is mutated (addNode) --
   const children = new Map<string, string[]>();
   const parents = new Map<string, string[]>();
-  g.nodes.forEach(n => { children.set(n.id, []); parents.set(n.id, []); });
-  g.edges.forEach(e => { children.get(e.from)!.push(e.to); parents.get(e.to)!.push(e.from); });
+  const ancOf = new Map<string, Set<string>>();
+  const descOf = new Map<string, Set<string>>();
 
   // Everything reachable from `start` along `adj` (start excluded).
   const reach = (start: string, adj: Map<string, string[]>): Set<string> => {
@@ -338,11 +351,13 @@ function render(container: HTMLElement, g: GraphDef): void {
     return seen;
   };
 
-  // Per-node reachability, computed once (the graph's structure is static —
-  // only which nodes are *visible* changes, via `excluded`).
-  const ancOf = new Map<string, Set<string>>();
-  const descOf = new Map<string, Set<string>>();
-  g.nodes.forEach(n => { ancOf.set(n.id, reach(n.id, parents)); descOf.set(n.id, reach(n.id, children)); });
+  function rebuildRelations(): void {
+    children.clear(); parents.clear(); ancOf.clear(); descOf.clear();
+    g.nodes.forEach(n => { children.set(n.id, []); parents.set(n.id, []); });
+    g.edges.forEach(e => { children.get(e.from)!.push(e.to); parents.get(e.to)!.push(e.from); });
+    g.nodes.forEach(n => { ancOf.set(n.id, reach(n.id, parents)); descOf.set(n.id, reach(n.id, children)); });
+  }
+  rebuildRelations();
 
   // ---- Mutable per-layout state, recomputed by relayout() -------------------
   let rankMap = new Map<string, number>();
@@ -677,6 +692,22 @@ function render(container: HTMLElement, g: GraphDef): void {
   let subBuffer = "";                    // digits typed in "subselect" mode
   let subPrior: string[] = [];          // selection to restore if subselect is cancelled
 
+  // ---- Banks A/D: named node sets, used to wire up newly-created nodes ------
+  let bankA: Set<string> | null = null;
+  let bankD: Set<string> | null = null;
+  // A node can only ever belong to one bank — this is what blocks banking a
+  // selection that overlaps the *other* bank.
+  const bankConflict = (bank: Set<string> | null): boolean =>
+    !!bank && selectedIds.some(id => bank.has(id));
+  function paintBankBadges(): void {
+    nodes.forEach((_ln, id) => {
+      const badge = nodeBank.get(id)!;
+      if (bankA && bankA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a"; badge.style.display = "block"; }
+      else if (bankD && bankD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d"; badge.style.display = "block"; }
+      else { badge.style.display = "none"; }
+    });
+  }
+
   const singularRank = (): number | null => {
     if (!selectedIds.length) return null;
     const r0 = rankMap.get(selectedIds[0])!;
@@ -793,9 +824,18 @@ function render(container: HTMLElement, g: GraphDef): void {
   focusDepthEl.textContent = "0";
   focusInd.appendChild(focusLetter);
   focusInd.appendChild(focusDepthEl);
-  bar.appendChild(modeBtn); bar.appendChild(selInd); bar.appendChild(lrInd); bar.appendChild(udInd); bar.appendChild(focusInd);
+  const aBtn = document.createElement("button");
+  aBtn.className = "dag-bankbtn a"; aBtn.type = "button"; aBtn.textContent = "A";
+  aBtn.title = "Bank A — A banks the selection, Alt+A clears it (click to clear)";
+  const dBtn = document.createElement("button");
+  dBtn.className = "dag-bankbtn d"; dBtn.type = "button"; dBtn.textContent = "D";
+  dBtn.title = "Bank D — D banks the selection, Alt+D clears it (click to clear)";
+  bar.appendChild(modeBtn); bar.appendChild(selInd); bar.appendChild(lrInd); bar.appendChild(udInd);
+  bar.appendChild(focusInd); bar.appendChild(aBtn); bar.appendChild(dBtn);
   document.body.appendChild(bar);
   modeBtn.addEventListener("click", () => { selMode = selMode === "union" ? "intersection" : "union"; refresh(); });
+  aBtn.addEventListener("click", () => { bankA = null; paintBankBadges(); updateBar(); });
+  dBtn.addEventListener("click", () => { bankD = null; paintBankBadges(); updateBar(); });
 
   function updateBar(): void {
     modeBtn.textContent = selMode === "intersection" ? "I" : "U";
@@ -807,6 +847,10 @@ function render(container: HTMLElement, g: GraphDef): void {
     selInd.textContent = t;
     lrInd.classList.toggle("off", !lrActive());
     udInd.classList.toggle("off", !udActive());
+    aBtn.classList.toggle("off", !bankA);
+    aBtn.classList.toggle("conflict", bankConflict(bankD));
+    dBtn.classList.toggle("off", !bankD);
+    dBtn.classList.toggle("conflict", bankConflict(bankA));
   }
 
   function updateFocusIndicator(): void {
@@ -840,23 +884,33 @@ function render(container: HTMLElement, g: GraphDef): void {
   hscrollTrack.className = "dag-hscroll";
   const hscrollTicks: HTMLDivElement[] = [];
   const hscrollBorders: HTMLDivElement[] = [];
-  for (let r = 0; r <= maxRank0; r++) {
+  // Tick and border are always created in pairs; the one trailing border past
+  // the true last tick is simply never shown (updateScrollbarGeometry hides
+  // any r >= maxRank), which sidesteps having to know which slot is "last".
+  function addScrollSlot(): void {
     const tick = document.createElement("div");
     tick.className = "dag-hscroll-tick";
     hscrollTrack.appendChild(tick);
     hscrollTicks.push(tick);
-    if (r < maxRank0) {
-      const border = document.createElement("div");
-      border.className = "dag-hscroll-border";
-      hscrollTrack.appendChild(border);
-      hscrollBorders.push(border);
-    }
+    const border = document.createElement("div");
+    border.className = "dag-hscroll-border";
+    hscrollTrack.appendChild(border);
+    hscrollBorders.push(border);
   }
+  for (let r = 0; r <= maxRank0; r++) addScrollSlot();
   const hscrollBox = document.createElement("div");
   hscrollBox.className = "dag-hscroll-box";
   hscrollTrack.appendChild(hscrollBox);
   hscrollWrap.appendChild(hscrollTrack);
   document.body.appendChild(hscrollWrap);
+
+  // Grow the rank/scrollbar pools to cover a larger graph (addNode only ever
+  // grows — a focused view narrows via `excluded` instead, never shrinking
+  // these pools).
+  function growRankPools(newMaxRank0: number): void {
+    for (let r = maxRank0 + 1; r <= newMaxRank0; r++) { addRankSlot(r); addScrollSlot(); }
+    maxRank0 = newMaxRank0;
+  }
 
   // Position/size the view box from a (possibly fractional, mid-drag) scroll value.
   const paintScrollbar = (colsFloat: number): void => {
@@ -1053,8 +1107,100 @@ function render(container: HTMLElement, g: GraphDef): void {
   };
   const exitSubselect = (): void => { selectedIds = subPrior; subBuffer = ""; mode = "nodes"; refresh(); };
 
+  // ---- Node creation (W opens the editor, below the DAG view) ---------------
+  let editorOpen = false;
+  let editorUseA = false;
+  let editorUseD = false;
+  let nextNodeSeq = 1;
+
+  const editorBox = document.createElement("div");
+  editorBox.className = "dag-nodebox";
+  const flagA = document.createElement("div"); flagA.className = "dag-nodebox-flag a";
+  const flagD = document.createElement("div"); flagD.className = "dag-nodebox-flag d";
+  const editorTitle = document.createElement("input");
+  editorTitle.type = "text"; editorTitle.className = "dag-nodebox-title"; editorTitle.placeholder = "Title";
+  const editorBody = document.createElement("textarea");
+  editorBody.className = "dag-nodebox-body"; editorBody.placeholder = "Body (optional)";
+  const editorHint = document.createElement("div");
+  editorHint.className = "dag-nodebox-hint";
+  editorHint.textContent = "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+W adds · Esc cancels";
+  editorBox.appendChild(flagA); editorBox.appendChild(flagD);
+  editorBox.appendChild(editorTitle); editorBox.appendChild(editorBody); editorBox.appendChild(editorHint);
+  document.body.appendChild(editorBox);
+
+  function updateEditorFlags(): void {
+    flagA.classList.toggle("on", editorUseA);
+    flagD.classList.toggle("on", editorUseD);
+  }
+  function openEditor(): void {
+    if (editorOpen) return;
+    editorOpen = true;
+    editorUseA = false; editorUseD = false;
+    editorTitle.value = ""; editorBody.value = "";
+    updateEditorFlags();
+    editorBox.classList.add("open");
+    editorTitle.focus();
+  }
+  function closeEditor(): void {
+    editorOpen = false;
+    editorBox.classList.remove("open");
+  }
+  function commitEditor(): void {
+    const title = editorTitle.value.trim();
+    if (!title) { editorTitle.focus(); return; }   // a node needs a label
+    addNode(title, editorBody.value.trim(), editorUseA, editorUseD);
+    closeEditor();
+  }
+
+  // Isolated from the rest of the app's shortcuts: stopPropagation keeps every
+  // keydown that reaches here (i.e. while a field in the box has focus) from
+  // ever being seen by the global handler below.
+  editorBox.addEventListener("keydown", ev => {
+    ev.stopPropagation();
+    const k = ev.key;
+    if (k === "Tab") {
+      ev.preventDefault();
+      (document.activeElement === editorTitle ? editorBody : editorTitle).focus();
+    } else if (ev.ctrlKey && (k === "a" || k === "A")) {
+      ev.preventDefault(); editorUseA = !editorUseA; updateEditorFlags();
+    } else if (ev.ctrlKey && (k === "d" || k === "D")) {
+      ev.preventDefault(); editorUseD = !editorUseD; updateEditorFlags();
+    } else if (ev.ctrlKey && (k === "w" || k === "W")) {
+      ev.preventDefault(); commitEditor();
+    } else if (k === "Escape") {
+      ev.preventDefault(); closeEditor();
+    }
+  });
+
+  // Add a new node to the (single, never-duplicated) graph `g`, wire it to
+  // whatever's currently in banks A/D per the two flags, and bring the
+  // persistent DOM up to date. Never touches selection or scroll position —
+  // adding a node can only ever need as many or more ranks, never fewer.
+  function addNode(title: string, body: string, useA: boolean, useD: boolean): void {
+    const id = "N" + nextNodeSeq++;
+    const def: NodeDef = { id, title, body: body || undefined };
+    g.nodes.push(def);
+    if (useA && bankA) bankA.forEach(a => g.edges.push({ from: a, to: id }));
+    if (useD && bankD) bankD.forEach(d => g.edges.push({ from: id, to: d }));
+
+    addNodeCard(def);
+    rebuildEdgeRecs();
+    rebuildRelations();
+
+    const newFullRankMap = computeRanks(g);
+    const newMaxRank0 = Math.max(...g.nodes.map(n => newFullRankMap.get(n.id)!));
+    if (newMaxRank0 > maxRank0) growRankPools(newMaxRank0);
+
+    relayout();
+    paintBankBadges();
+    refresh();
+  }
+
   // ---- Mouse ---------------------------------------------------------------
-  nodes.forEach(ln => {
+  // A function declaration (hoisted) so addNodeCard can wire a node up front,
+  // before the rest of this section — which defines mode/selectedIds/etc — has
+  // executed. The listeners themselves only run later, once those exist.
+  function wireNode(ln: LaidNode): void {
     const id = ln.def.id;
     ln.el.addEventListener("click", ev => {
       ev.stopPropagation();
@@ -1078,7 +1224,7 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (mode !== "idle") return;
       resetFocus();
     });
-  });
+  }
 
   // ---- Keyboard ------------------------------------------------------------
   document.addEventListener("keydown", e => { if (e.key === "Shift" && !shiftHeld) { shiftHeld = true; updateCursors(); } });
@@ -1095,6 +1241,19 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (k === "i" || k === "I") { e.preventDefault(); selMode = "intersection"; refresh(); return; }
     if (k === "u" || k === "U") { e.preventDefault(); selMode = "union"; refresh(); return; }
     if (k === "f" || k === "F") { e.preventDefault(); if (e.altKey) popFocus(); else pushFocus(e.shiftKey); return; }
+    if (k === "a" || k === "A") {
+      e.preventDefault();
+      if (e.altKey) { bankA = null; paintBankBadges(); updateBar(); }
+      else if (selectedIds.length && !bankConflict(bankD)) { bankA = new Set(selectedIds); paintBankBadges(); updateBar(); }
+      return;
+    }
+    if (k === "d" || k === "D") {
+      e.preventDefault();
+      if (e.altKey) { bankD = null; paintBankBadges(); updateBar(); }
+      else if (selectedIds.length && !bankConflict(bankA)) { bankD = new Set(selectedIds); paintBankBadges(); updateBar(); }
+      return;
+    }
+    if ((k === "w" || k === "W") && !e.ctrlKey && !e.altKey) { e.preventDefault(); openEditor(); return; }
 
     if (k === "Home") { e.preventDefault(); selectRankNodes(0); return; }
     if (k === "End")  { e.preventDefault(); selectRankNodes(maxRank); return; }
