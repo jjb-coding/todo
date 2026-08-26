@@ -216,27 +216,65 @@ body {
 
 .dag-nodebox {
   order: 3;
-  display: none;
   position: relative;
-  background: var(--panel); color: var(--node-title);
-  padding: 12px 16px 16px;
+  color: var(--node-title);
+  padding: 12px;
   border-top: 1px solid #e1e7ee;
 }
-.dag-nodebox.open { display: block; }
+/* Existing: black/white cross-hatch. New: green wash. Sits behind the plain
+   inset panel (.dag-nodebox-inner) that the actual form controls live on,
+   per the "inset against a plain background for clarity" requirement. */
+.dag-nodebox.mode-existing {
+  background-image: repeating-linear-gradient(45deg, #fff 0, #fff 7px, #16181c 7px, #16181c 14px);
+}
+.dag-nodebox.mode-new {
+  background: #d9f2df;
+}
+.dag-nodebox.mode-disabled .dag-nodebox-modeicon { display: none; }
+.dag-nodebox-modeicon {
+  position: absolute; top: 8px; right: 10px; z-index: 1;
+  min-width: 18px; height: 18px; padding: 0 4px; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 800; letter-spacing: .5px;
+  background: #fff; color: var(--node-title); border: 1px solid var(--node-border);
+}
+.dag-nodebox-inner {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 10px 12px 12px;
+  position: relative;
+}
 .dag-nodebox-title, .dag-nodebox-body {
   display: block; width: 100%; box-sizing: border-box;
   background: #fff; color: var(--node-title); border: 1px solid var(--node-border); border-radius: 8px;
   font-family: inherit; font-size: 13px; padding: 8px 10px; margin-top: 8px;
 }
+/* Default (empty) look: greyed-out, until there's actual content. */
+.dag-nodebox-title:placeholder-shown, .dag-nodebox-body:placeholder-shown {
+  background: #eef1f5; color: #9aa5b1; border-color: #dde3ea;
+}
+/* Fully disabled (no draft, no single selection): stronger grey, inert. */
+.dag-nodebox-title:disabled, .dag-nodebox-body:disabled {
+  background: #e4e8ed; color: #b7c0cb; border-color: #dde3ea; cursor: not-allowed;
+}
 .dag-nodebox-body { resize: vertical; min-height: 60px; }
 .dag-nodebox-hint { margin-top: 8px; font-size: 11px; color: var(--node-body); }
 .dag-nodebox-buttons { display: flex; gap: 8px; margin-top: 10px; }
 .dag-nodebox-btn {
-  padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  width: 84px; padding: 6px 0; border-radius: 8px; cursor: pointer;
   border: 1px solid var(--node-border); background: var(--col-a); color: var(--node-title);
-  font-family: inherit; font-size: 13px; font-weight: 600;
+  font-family: inherit; font-size: 13px; font-weight: 600; text-align: center;
 }
 .dag-nodebox-btn.primary { background: #f5b301; border-color: #d9a441; color: #1b1200; }
+/* Soft-disabled (e.g. Add with no title yet, or Save with no changes): a
+   lighter grey than the fully-disabled input state above. Fully-disabled
+   (the "disabled" editor mode) additionally has nothing to click at all. */
+.dag-nodebox-btn:disabled {
+  cursor: not-allowed; opacity: .5;
+}
+.dag-nodebox.mode-disabled .dag-nodebox-btn:disabled {
+  opacity: .35;
+}
 .dag-nodebox-flag {
   position: absolute; top: 50%; transform: translateY(-50%);
   width: 6px; height: 26px; display: none;

@@ -558,7 +558,9 @@ function render(container: HTMLElement, g: GraphDef): void {
   const updateCursors = (): void => {
     const barring = shiftHeld || prospective !== null;
     nodes.forEach(ln => {
-      ln.el.style.cursor = barring && barredSet.has(ln.def.id) ? "not-allowed" : "pointer";
+      const id = ln.def.id;
+      const barred = barredSet.has(id) || prospectiveBlocked(id);
+      ln.el.style.cursor = barring && barred ? "not-allowed" : "pointer";
     });
   };
 
@@ -744,6 +746,16 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (letter === "D") return aIsDescendant;
     return dIsAncestor || aIsDescendant;
   }
+  // Would clicking `id` while `letter` is prospective be rejected outright —
+  // it's already in a different bank, or it would create an A/D cycle? Used
+  // both to keep the click from ever adding it, and to bar the cursor over
+  // it. Never true for an already-selected node: toggling one back off is
+  // always allowed.
+  function prospectiveBlocked(id: string): boolean {
+    if (prospective === null || selectedIds.includes(id)) return false;
+    if ((["A", "D", "S"] as BankLetter[]).some(l => l !== prospective && bankOf(l)?.has(id))) return true;
+    return wouldCreateCycle(prospective, [id]);
+  }
   function paintBankBadges(): void {
     nodes.forEach((_ln, id) => {
       const badge = nodeBank.get(id)!;
@@ -766,9 +778,14 @@ function render(container: HTMLElement, g: GraphDef): void {
   }
   function clearBankS(): void { bankS = null; paintBankBadges(); updateBar(); }
   // Right-click: toggle S disabled/enabled, always emptying it in the process.
+  // If S's icon was mid-hover (cross-hatch applied) when this fires, the
+  // matching mouseleave never runs because bankS is already gone by then —
+  // so its members would be stuck cross-hatched forever. Clear it here first.
   function toggleDisableS(): void {
+    const prevS = bankS;
     bankSDisabled = !bankSDisabled;
     bankS = null;
+    if (prevS) prevS.forEach(id => nodes.get(id)?.el.classList.remove("bank-hover"));
     paintBankBadges(); updateBar();
   }
   // The set wireBankToS should treat as "S" — the real bank, unless it's been
@@ -818,7 +835,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   function pressBank(letter: BankLetter): void {
     if (prospective !== null) return;
     if (letter === "S" && bankSDisabled) return;
-    if (!selectedIds.length) { prospective = letter; updateBar(); return; }
+    if (!selectedIds.length) { prospective = letter; updateBar(); updateCursors(); return; }
     setBank(letter, selectedIds);
   }
   // Shift+letter: XOR the current selection's membership in that bank instead
@@ -943,14 +960,15 @@ function render(container: HTMLElement, g: GraphDef): void {
 
   // One renderer for whatever mode we're in.
   function refresh(): void {
-    if (mode === "idle") { resetFocus(); updateBar(); return; }
-    if (mode === "rank") { resetFocus(); renderRank(rankSel); updateBar(); return; }
+    if (mode === "idle") { resetFocus(); updateBar(); syncEditor(); return; }
+    if (mode === "rank") { resetFocus(); renderRank(rankSel); updateBar(); syncEditor(); return; }
     applyFocus(selectedIds, 1, true);            // "nodes" or "subselect"
     if (selectedIds.length >= 2) {
       renderEnum();
       if (mode === "subselect") renderSubselect();
     }
     updateBar();
+    syncEditor();
   }
 
   // ---- Status bar (union/intersection, selection type, nav hints, focus) ----
@@ -990,8 +1008,8 @@ function render(container: HTMLElement, g: GraphDef): void {
   dBtn.className = "dag-bankbtn d"; dBtn.type = "button"; dBtn.textContent = "D";
   dBtn.title = "Bank D — D banks/arms, Shift+D toggles membership, Alt+D clears, Ctrl+D/Ctrl+Shift+D wire it onto S as children, hold C then D to centre on it";
   const editorInd = document.createElement("button");
-  editorInd.className = "dag-editorind"; editorInd.type = "button"; editorInd.textContent = "I";
-  editorInd.title = "New node editor — W opens, click toggles open/closed";
+  editorInd.className = "dag-editorind open"; editorInd.type = "button"; editorInd.textContent = "I";
+  editorInd.title = "Node editor (below) — W or click starts a new node; select one node to edit it";
   const delBtn = document.createElement("button");
   delBtn.className = "dag-delbtn"; delBtn.type = "button"; delBtn.textContent = "Del";
   delBtn.disabled = true;
@@ -1018,7 +1036,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   sBtn.addEventListener("click", () => clearBankS());
   dBtn.addEventListener("click", () => clearBankD());
   sBtn.addEventListener("contextmenu", ev => { ev.preventDefault(); toggleDisableS(); });
-  editorInd.addEventListener("click", () => { if (editorOpen) closeEditor(); else openEditor(); });
+  editorInd.addEventListener("click", () => startNewNode());
   delBtn.addEventListener("click", () => deleteNodes(selectedIds));
 
   // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
@@ -1331,11 +1349,17 @@ function render(container: HTMLElement, g: GraphDef): void {
     mode = "nodes"; refresh(); reveal();
   };
   // Space: advance the selection from the selected (yellow) nodes to the
-  // frontier (dotted) nodes just beyond them.
+  // frontier (dotted) nodes just beyond them. Selected nodes that are leaves
+  // (no children, so they have no frontier of their own to hand off to) stay
+  // selected instead of being dropped.
   const advance = (): void => {
     const { dotted } = computeGreenAndDotted(selectedIds, false);
-    if (!dotted.size) return;
-    selectedIds = [...dotted]; mode = "nodes"; subBuffer = "";
+    const next = new Set<string>(dotted);
+    selectedIds.forEach(id => {
+      if (!children.get(id)!.some(c => included(c))) next.add(id);
+    });
+    if (!next.size) return;
+    selectedIds = [...next]; mode = "nodes"; subBuffer = "";
     refresh(); reveal();
   };
 
@@ -1357,14 +1381,28 @@ function render(container: HTMLElement, g: GraphDef): void {
   };
   const exitSubselect = (): void => { selectedIds = subPrior; subBuffer = ""; mode = "nodes"; refresh(); };
 
-  // ---- Node creation (W opens the editor, below the DAG view) ---------------
-  let editorOpen = false;
+  // ---- Node editor (always open, below the DAG view) ------------------------
+  // Three states: "disabled" (nothing to do — the resting default), "new" (a
+  // fresh node draft, entered only by explicitly pressing W — see
+  // startNewNode — and then locked in regardless of what gets selected
+  // afterwards), and "existing" (mirrors the single selected node, whenever
+  // one exists and "new" isn't locked in). See syncEditor() for the switch.
+  type EditorMode = "disabled" | "new" | "existing";
   let editorUseA = false;
   let editorUseD = false;
+  let editingNew = false;               // locked into "new" (via startNewNode) until committed/cleared
+  let editorOrigTitle = "";             // existing-mode baseline, for the Save dirty-check
+  let editorOrigBody = "";
+  let lastEditorMode: EditorMode | undefined;
+  let lastEditorTarget: string | null | undefined;
   let nextNodeSeq = 1;
 
   const editorBox = document.createElement("div");
   editorBox.className = "dag-nodebox";
+  const editorModeIcon = document.createElement("div");
+  editorModeIcon.className = "dag-nodebox-modeicon";
+  const editorInner = document.createElement("div");
+  editorInner.className = "dag-nodebox-inner";
   const flagA = document.createElement("div"); flagA.className = "dag-nodebox-flag a";
   const flagD = document.createElement("div"); flagD.className = "dag-nodebox-flag d";
   const editorTitle = document.createElement("input");
@@ -1373,47 +1411,142 @@ function render(container: HTMLElement, g: GraphDef): void {
   editorBody.className = "dag-nodebox-body"; editorBody.placeholder = "Body (optional)";
   const editorHint = document.createElement("div");
   editorHint.className = "dag-nodebox-hint";
-  editorHint.textContent = "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+Enter adds · Esc cancels";
   const editorButtons = document.createElement("div");
   editorButtons.className = "dag-nodebox-buttons";
   const editorAddBtn = document.createElement("button");
   editorAddBtn.type = "button"; editorAddBtn.className = "dag-nodebox-btn primary";
-  editorAddBtn.textContent = "Add Node"; editorAddBtn.tabIndex = -1;
+  editorAddBtn.textContent = "Add"; editorAddBtn.tabIndex = -1;
   const editorCancelBtn = document.createElement("button");
   editorCancelBtn.type = "button"; editorCancelBtn.className = "dag-nodebox-btn";
-  editorCancelBtn.textContent = "Cancel"; editorCancelBtn.tabIndex = -1;
+  editorCancelBtn.textContent = "Clear"; editorCancelBtn.tabIndex = -1;
   editorButtons.appendChild(editorAddBtn); editorButtons.appendChild(editorCancelBtn);
-  editorBox.appendChild(flagA); editorBox.appendChild(flagD);
-  editorBox.appendChild(editorTitle); editorBox.appendChild(editorBody);
-  editorBox.appendChild(editorHint); editorBox.appendChild(editorButtons);
+  editorInner.appendChild(flagA); editorInner.appendChild(flagD);
+  editorInner.appendChild(editorTitle); editorInner.appendChild(editorBody);
+  editorInner.appendChild(editorHint); editorInner.appendChild(editorButtons);
+  editorBox.appendChild(editorModeIcon); editorBox.appendChild(editorInner);
   panelFooter.appendChild(editorBox);
-  editorAddBtn.addEventListener("click", () => commitEditor());
-  editorCancelBtn.addEventListener("click", () => closeEditor());
+  editorAddBtn.addEventListener("click", () => { if (lastEditorMode === "existing") commitExisting(); else commitNew(); });
+  editorCancelBtn.addEventListener("click", () => { if (lastEditorMode === "existing") deleteEditorTarget(); else clearEditorDraft(); });
 
   function updateEditorFlags(): void {
     flagA.classList.toggle("on", editorUseA);
     flagD.classList.toggle("on", editorUseD);
   }
-  function openEditor(): void {
-    if (editorOpen) return;
-    editorOpen = true;
-    editorUseA = !!bankA; editorUseD = !!bankD;   // default on if there's something to attach
-    editorTitle.value = ""; editorBody.value = "";
-    updateEditorFlags();
-    editorBox.classList.add("open");
-    editorInd.classList.add("open");
+  // Paint the chrome (background/icon/hint/buttons/disabled-ness) for
+  // whichever mode is currently showing — cheap, so it's fine to call on
+  // every syncEditor pass and every keystroke.
+  function paintEditorChrome(mode: EditorMode): void {
+    editorBox.classList.toggle("mode-new", mode === "new");
+    editorBox.classList.toggle("mode-existing", mode === "existing");
+    editorBox.classList.toggle("mode-disabled", mode === "disabled");
+    editorTitle.disabled = mode === "disabled";
+    editorBody.disabled = mode === "disabled";
+    flagA.style.display = mode === "new" ? "" : "none";
+    flagD.style.display = mode === "new" ? "" : "none";
+    if (mode === "existing") {
+      editorModeIcon.textContent = "E";
+      editorAddBtn.textContent = "Save";
+      editorCancelBtn.textContent = "Delete";
+      const dirty = editorTitle.value !== editorOrigTitle || editorBody.value !== editorOrigBody;
+      editorAddBtn.disabled = !dirty || !editorTitle.value.trim();
+      editorCancelBtn.disabled = false;
+      editorHint.textContent = "Editing the selected node · Esc deselects";
+    } else {
+      editorModeIcon.textContent = "N";
+      editorAddBtn.textContent = "Add";
+      editorCancelBtn.textContent = "Clear";
+      editorAddBtn.disabled = mode === "disabled" || !editorTitle.value.trim();
+      editorCancelBtn.disabled = mode === "disabled";
+      editorHint.textContent = mode === "disabled"
+        ? "W starts a new node · select a single node to edit it"
+        : "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+Enter adds · Esc clears";
+    }
+  }
+  // Recomputes which node (if any) the editor should be showing, and
+  // repopulates its fields only when that target actually changes — so an
+  // unrelated refresh() (e.g. toggling U/I) never clobbers an in-progress
+  // draft or a live edit mid-keystroke.
+  function syncEditor(): void {
+    const mode: EditorMode = editingNew ? "new" : (selectedIds.length === 1 ? "existing" : "disabled");
+    const target = mode === "existing" ? selectedIds[0] : null;
+    if (mode !== lastEditorMode || target !== lastEditorTarget) {
+      lastEditorMode = mode; lastEditorTarget = target;
+      if (mode === "existing") {
+        const def = nodes.get(target!)!.def;
+        editorOrigTitle = def.title; editorOrigBody = def.body || "";
+        editorTitle.value = editorOrigTitle; editorBody.value = editorOrigBody;
+      } else {
+        editorTitle.value = ""; editorBody.value = "";
+        if (mode === "disabled") { editorUseA = false; editorUseD = false; updateEditorFlags(); }
+      }
+    }
+    paintEditorChrome(mode);
+  }
+  // W (or the "I" status-bar icon): explicitly start a fresh new-node draft,
+  // locking the editor into "new" no matter what gets selected afterwards.
+  function startNewNode(): void {
+    if (!editingNew) {
+      editingNew = true;
+      editorUseA = !!bankA; editorUseD = !!bankD;   // default on if there's something to attach
+      updateEditorFlags();
+      lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
+      syncEditor();
+    }
     editorTitle.focus();
   }
-  function closeEditor(): void {
-    editorOpen = false;
-    editorBox.classList.remove("open");
-    editorInd.classList.remove("open");
+  function clearEditorDraft(): void {
+    editorTitle.value = ""; editorBody.value = "";
+    editingNew = false;
+    editorUseA = false; editorUseD = false; updateEditorFlags();
+    lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync even if mode/target don't change
+    syncEditor();
   }
-  function commitEditor(): void {
+  // Apply title/body edits onto the node actually being edited.
+  function updateNodeContent(id: string, title: string, body: string): void {
+    const ln = nodes.get(id); if (!ln) return;
+    ln.def.title = title;
+    ln.def.body = body || undefined;
+    (ln.el.querySelector(".dag-node-title") as HTMLDivElement).textContent = title;
+    let bodyEl = ln.el.querySelector(".dag-node-body") as HTMLDivElement | null;
+    if (body) {
+      if (!bodyEl) {
+        bodyEl = document.createElement("div");
+        bodyEl.className = "dag-node-body";
+        ln.el.insertBefore(bodyEl, nodeTally.get(id)!);
+      }
+      bodyEl.textContent = body;
+    } else if (bodyEl) {
+      bodyEl.remove();
+    }
+    ln.height = ln.el.offsetHeight;
+    relayout();
+  }
+  const onEditorInput = (): void => paintEditorChrome(lastEditorMode ?? "disabled");
+  editorTitle.addEventListener("input", onEditorInput);
+  editorBody.addEventListener("input", onEditorInput);
+  function commitNew(): void {
     const title = editorTitle.value.trim();
     if (!title) { editorTitle.focus(); return; }   // a node needs a label
-    addNode(title, editorBody.value.trim(), editorUseA, editorUseD);
-    closeEditor();
+    const body = editorBody.value.trim(), useA = editorUseA, useD = editorUseD;
+    addNode(title, body, useA, useD);
+    editingNew = false;
+    editorUseA = false; editorUseD = false; updateEditorFlags();
+    lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
+    syncEditor();
+  }
+  function commitExisting(): void {
+    if (lastEditorMode !== "existing" || !lastEditorTarget) return;
+    const title = editorTitle.value.trim();
+    if (!title) { editorTitle.focus(); return; }
+    const body = editorBody.value.trim();
+    updateNodeContent(lastEditorTarget, title, body);
+    editorOrigTitle = title; editorOrigBody = body;
+    editorTitle.value = title; editorBody.value = body;
+    paintEditorChrome("existing");
+  }
+  function deleteEditorTarget(): void {
+    if (lastEditorMode !== "existing" || !lastEditorTarget) return;
+    deleteNodes([lastEditorTarget]);
   }
 
   // Isolated from the rest of the app's shortcuts: stopPropagation keeps every
@@ -1437,9 +1570,12 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
       else pressBank("D");
     } else if (ev.ctrlKey && k === "Enter") {
-      ev.preventDefault(); commitEditor();
+      ev.preventDefault();
+      if (lastEditorMode === "existing") commitExisting(); else commitNew();
     } else if (k === "Escape") {
-      ev.preventDefault(); closeEditor();
+      ev.preventDefault();
+      if (lastEditorMode === "existing") { selectedIds = []; mode = "idle"; refresh(); }
+      else clearEditorDraft();
     }
   });
 
@@ -1537,7 +1673,7 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (toggling) {
         if (selectedIds.includes(id)) {
           selectedIds = selectedIds.filter(x => x !== id);           // already selected -> deselect
-        } else if (!blockedSet.has(id)) {
+        } else if (!blockedSet.has(id) && !prospectiveBlocked(id)) {
           selectedIds = [...selectedIds, id];                        // barrier: an insensible pick
         }
         mode = selectedIds.length ? "nodes" : "idle";
@@ -1598,8 +1734,14 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (k === "Shift" || k === "c" || k === "C") return;   // handled by the tracking listener above
 
     // A prospective bank takes over Esc/Enter before anything else does.
-    if (prospective !== null && k === "Escape") { e.preventDefault(); prospective = null; updateBar(); return; }
+    if (prospective !== null && k === "Escape") { e.preventDefault(); prospective = null; updateBar(); updateCursors(); return; }
     if (prospective !== null && k === "Enter")  { e.preventDefault(); commitProspective(); return; }
+    // Pressing the same letter that armed prospective mode also completes it
+    // (e.g. arm with A, complete with A again) — same effect as Enter.
+    if (prospective !== null && !e.ctrlKey && !e.altKey && !e.shiftKey &&
+        k.toLowerCase() === prospective.toLowerCase()) {
+      e.preventDefault(); commitProspective(); return;
+    }
 
     // Holding C takes priority over A/S/D's own bindings (see above).
     if (heldC && !e.ctrlKey && !e.altKey && !e.shiftKey &&
@@ -1638,7 +1780,7 @@ function render(container: HTMLElement, g: GraphDef): void {
       else pressBank("S");
       return;
     }
-    if ((k === "w" || k === "W") && !e.ctrlKey && !e.altKey) { e.preventDefault(); openEditor(); return; }
+    if ((k === "w" || k === "W") && !e.ctrlKey && !e.altKey) { e.preventDefault(); startNewNode(); return; }
 
     if (k === "Delete" && selectedIds.length) { e.preventDefault(); deleteNodes(selectedIds); return; }
 
@@ -1691,6 +1833,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   applyScroll();
   updateBar();
   updateFocusIndicator();
+  syncEditor();
 }
 
 // ============================================================================
