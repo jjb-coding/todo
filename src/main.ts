@@ -210,6 +210,14 @@ function render(container: HTMLElement, g: GraphDef): void {
   svg.innerHTML = "<defs>" + markers + rankHatch + "</defs>";
   container.appendChild(svg);
 
+  // A sticky footer, inside the same white-bordered pane as the DAG itself,
+  // holding (top to bottom) the rank scrollbar, the icon bar, and the node
+  // editor — CSS `order` on each fixes that stacking regardless of the order
+  // they're actually built in below.
+  const panelFooter = document.createElement("div");
+  panelFooter.className = "dag-panel-footer";
+  container.parentElement!.appendChild(panelFooter);
+
   // --- Column backgrounds + rank labels, sized to the full graph's rank count.
   // A focused subgraph can only ever need fewer; adding a node can only ever
   // need more — growRankPools() (below, near the scrollbar) extends the pool
@@ -540,12 +548,17 @@ function render(container: HTMLElement, g: GraphDef): void {
 
   // --- Selection, multi-selection, lineage tallies ---------------------------
   let blockedSet = new Set<string>();   // already-emphasised nodes: can't be shift-added
+  let barredSet = new Set<string>();    // green/red only — drives the "not-allowed" cursor
   let shiftHeld = false;
   let selMode: "union" | "intersection" = "union";
 
+  // The barrier cursor only signals that adding a green/red node is blocked —
+  // toggling (Shift, or prospective mode overriding it) an already-selected
+  // node back off is always allowed, so selected nodes never show it.
   const updateCursors = (): void => {
+    const barring = shiftHeld || prospective !== null;
     nodes.forEach(ln => {
-      ln.el.style.cursor = shiftHeld && blockedSet.has(ln.def.id) ? "not-allowed" : "pointer";
+      ln.el.style.cursor = barring && barredSet.has(ln.def.id) ? "not-allowed" : "pointer";
     });
   };
 
@@ -566,6 +579,7 @@ function render(container: HTMLElement, g: GraphDef): void {
       l.style.padding = ""; l.style.borderRadius = "";
     });
     blockedSet = new Set();
+    barredSet = new Set();
     updateCursors();
   }
 
@@ -638,6 +652,9 @@ function render(container: HTMLElement, g: GraphDef): void {
     const blocked = new Set<string>(sel);
     green.forEach(k => blocked.add(k));
     red.forEach((_v, k) => blocked.add(k));
+    const barred = new Set<string>();               // green/red only — never the selection itself
+    green.forEach(k => barred.add(k));
+    red.forEach((_v, k) => barred.add(k));
 
     nodes.forEach(ln => {
       const id = ln.def.id, st = ln.el.style;
@@ -681,6 +698,7 @@ function render(container: HTMLElement, g: GraphDef): void {
     });
 
     blockedSet = committed ? blocked : new Set();
+    barredSet = committed ? barred : new Set();
     updateCursors();
   }
 
@@ -692,20 +710,158 @@ function render(container: HTMLElement, g: GraphDef): void {
   let subBuffer = "";                    // digits typed in "subselect" mode
   let subPrior: string[] = [];          // selection to restore if subselect is cancelled
 
-  // ---- Banks A/D: named node sets, used to wire up newly-created nodes ------
+  // ---- Banks A/D/S: named node sets ------------------------------------------
+  // A/D wire up newly-created nodes as ancestors/descendants; S is a target
+  // for directly wiring A/D's nodes onto existing ones (see wireBankToS).
+  type BankLetter = "A" | "D" | "S";
   let bankA: Set<string> | null = null;
   let bankD: Set<string> | null = null;
+  let bankS: Set<string> | null = null;
+  // Right-click on S deactivates it: emptied, and the Ctrl+A/Ctrl+D wiring
+  // actions fall back to using the current selection directly instead of S.
+  let bankSDisabled = false;
+  // Pressing a bank key with nothing selected arms it, waiting for a selection
+  // to bank (and deselect) on the next press — instead of banking immediately.
+  let prospective: BankLetter | null = null;
+
+  const bankOf = (letter: BankLetter): Set<string> | null =>
+    letter === "A" ? bankA : letter === "D" ? bankD : bankS;
   // A node can only ever belong to one bank — this is what blocks banking a
-  // selection that overlaps the *other* bank.
+  // selection that overlaps a *different* bank.
   const bankConflict = (bank: Set<string> | null): boolean =>
     !!bank && selectedIds.some(id => bank.has(id));
+  const otherBanksConflict = (letter: BankLetter): boolean =>
+    (["A", "D", "S"] as BankLetter[]).some(l => l !== letter && bankConflict(bankOf(l)));
+  // A/D feed a new node's ancestors/descendants, and A/D also wire directly
+  // onto S (see wireBankToS) — so banking any of the three while another
+  // already holds an ancestor/descendant of the incoming selection would wire
+  // a cycle, and is blocked here instead. S is subject to both halves of the
+  // check, since it plays the "future node" role for both A and D at once.
+  function wouldCreateCycle(letter: BankLetter, sel: string[]): boolean {
+    const dIsAncestor = !!bankD && sel.some(s => Array.from(bankD!).some(d => ancOf.get(s)!.has(d)));
+    const aIsDescendant = !!bankA && sel.some(s => Array.from(bankA!).some(a => descOf.get(s)!.has(a)));
+    if (letter === "A") return dIsAncestor;
+    if (letter === "D") return aIsDescendant;
+    return dIsAncestor || aIsDescendant;
+  }
   function paintBankBadges(): void {
     nodes.forEach((_ln, id) => {
       const badge = nodeBank.get(id)!;
       if (bankA && bankA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a"; badge.style.display = "block"; }
       else if (bankD && bankD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d"; badge.style.display = "block"; }
+      else if (bankS && bankS.has(id)) { badge.textContent = "S"; badge.className = "dag-bank-badge s"; badge.style.display = "block"; }
       else { badge.style.display = "none"; }
     });
+  }
+  // Clearing A/D also switches off the editor's matching toggle, if it was on.
+  function clearBankA(): void {
+    bankA = null;
+    if (editorUseA) { editorUseA = false; updateEditorFlags(); }
+    paintBankBadges(); updateBar();
+  }
+  function clearBankD(): void {
+    bankD = null;
+    if (editorUseD) { editorUseD = false; updateEditorFlags(); }
+    paintBankBadges(); updateBar();
+  }
+  function clearBankS(): void { bankS = null; paintBankBadges(); updateBar(); }
+  // Right-click: toggle S disabled/enabled, always emptying it in the process.
+  function toggleDisableS(): void {
+    bankSDisabled = !bankSDisabled;
+    bankS = null;
+    paintBankBadges(); updateBar();
+  }
+  // The set wireBankToS should treat as "S" — the real bank, unless it's been
+  // disabled, in which case the current selection stands in for it directly
+  // (and is never itself recorded into the bank).
+  const effectiveS = (): Set<string> | null =>
+    bankSDisabled ? (selectedIds.length ? new Set(selectedIds) : null) : bankS;
+  // Giving each focus level its own banks would be a coordination nightmare
+  // (a node banked here, then edited on a deeper level such that it becomes
+  // kin of other bank members up here...) — simplest and safest is to just
+  // empty everything whenever focus is pushed or popped.
+  function clearAllBanks(): void {
+    bankA = null; bankD = null; bankS = null;
+    bankSDisabled = false;
+    prospective = null;
+    editorUseA = false; editorUseD = false; updateEditorFlags();
+    paintBankBadges(); updateBar();
+  }
+  // A node can belong to at most one bank; right-click removes it from
+  // whichever it's currently in (a no-op if it's in none).
+  function removeFromBanks(id: string): boolean {
+    let changed = false;
+    if (bankA?.delete(id)) { changed = true; if (!bankA.size) bankA = null; }
+    if (bankD?.delete(id)) { changed = true; if (!bankD.size) bankD = null; }
+    if (bankS?.delete(id)) { changed = true; if (!bankS.size) bankS = null; }
+    return changed;
+  }
+
+  // Try to bank `sel` into the given letter. Fails silently (returns false) on
+  // a cross-bank conflict or a would-be A/D cycle. Setting A/D also toggles
+  // the editor's matching attach flag, mirroring Ctrl+A/Ctrl+D in the editor.
+  function setBank(letter: BankLetter, sel: string[]): boolean {
+    if (otherBanksConflict(letter)) return false;
+    if (wouldCreateCycle(letter, sel)) return false;
+    const set = new Set(sel);
+    if (letter === "A") { bankA = set; editorUseA = !editorUseA; updateEditorFlags(); }
+    else if (letter === "D") { bankD = set; editorUseD = !editorUseD; updateEditorFlags(); }
+    else { bankS = set; }
+    paintBankBadges(); updateBar();
+    return true;
+  }
+  // The full behaviour of pressing a bank key with the DAG in focus: arms
+  // prospective mode when nothing's selected, or banks immediately otherwise.
+  // While any bank is prospective, no bank key does anything further — Enter
+  // commits it (see the keydown handler) and Esc cancels it, regardless of
+  // which bank is armed.
+  function pressBank(letter: BankLetter): void {
+    if (prospective !== null) return;
+    if (letter === "S" && bankSDisabled) return;
+    if (!selectedIds.length) { prospective = letter; updateBar(); return; }
+    setBank(letter, selectedIds);
+  }
+  // Shift+letter: XOR the current selection's membership in that bank instead
+  // of overwriting it. Each node is still subject to the usual cross-bank and
+  // cycle checks (individually — only the nodes that pass are toggled in).
+  function toggleBankMembership(letter: BankLetter, sel: string[]): void {
+    if (prospective !== null || !sel.length) return;
+    if (letter === "S" && bankSDisabled) return;
+    const cur = bankOf(letter);
+    const next = cur ? new Set(cur) : new Set<string>();
+    let changed = false;
+    sel.forEach(id => {
+      if (next.has(id)) { next.delete(id); changed = true; return; }
+      const conflicts = (["A", "D", "S"] as BankLetter[]).some(l => l !== letter && bankOf(l)?.has(id));
+      if (conflicts || wouldCreateCycle(letter, [id])) return;
+      next.add(id); changed = true;
+    });
+    if (!changed) return;
+    const result = next.size ? next : null;
+    if (letter === "A") { bankA = result; editorUseA = !editorUseA; updateEditorFlags(); }
+    else if (letter === "D") { bankD = result; editorUseD = !editorUseD; updateEditorFlags(); }
+    else { bankS = result; }
+    paintBankBadges(); updateBar();
+  }
+  // Enter, while a bank is armed: commit its selection, deselecting on success.
+  // A failed attempt (conflict/cycle) or an empty selection leaves it armed.
+  function commitProspective(): void {
+    if (prospective === null) return;
+    if (selectedIds.length && setBank(prospective, selectedIds)) {
+      selectedIds = []; mode = "idle"; subBuffer = "";
+      prospective = null;
+      refresh();
+    } else {
+      updateBar();
+    }
+  }
+  // Ctrl+A/Ctrl+D-on-S: if S is empty (and not disabled) but the current
+  // selection would itself be a valid bank S, fill it first (as if S were
+  // pressed) before the wiring action runs. Skipped while another bank is
+  // prospective, same as pressBank — and while S is disabled, since then the
+  // wiring action uses the selection directly and must never bank it.
+  function ensureBankS(): void {
+    if (prospective === null && !bankSDisabled && !bankS && selectedIds.length) setBank("S", selectedIds);
   }
 
   const singularRank = (): number | null => {
@@ -816,7 +972,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   udInd.title = "Up/Down arrows — active when they'd move within a rank";
   const focusInd = document.createElement("div");
   focusInd.className = "dag-focusind";
-  focusInd.title = "Focus — F narrows to the selection's ancestry, Shift+F also keeps fully-covered nodes, Alt+F pops back out";
+  focusInd.title = "Focus — F narrows to the selection's ancestry, Shift+F pops back out";
   const focusLetter = document.createElement("span");
   focusLetter.textContent = "F";
   const focusDepthEl = document.createElement("span");
@@ -826,16 +982,84 @@ function render(container: HTMLElement, g: GraphDef): void {
   focusInd.appendChild(focusDepthEl);
   const aBtn = document.createElement("button");
   aBtn.className = "dag-bankbtn a"; aBtn.type = "button"; aBtn.textContent = "A";
-  aBtn.title = "Bank A — A banks the selection, Alt+A clears it (click to clear)";
+  aBtn.title = "Bank A — A banks/arms, Shift+A toggles membership, Alt+A clears, Ctrl+A/Ctrl+Shift+A wire it onto S as parents, hold C then A to centre on it";
+  const sBtn = document.createElement("button");
+  sBtn.className = "dag-bankbtn s"; sBtn.type = "button"; sBtn.textContent = "S";
+  sBtn.title = "Bank S — S banks/arms, Shift+S toggles membership, Alt+S clears, right-click disables (S's wiring actions then use the selection directly), hold C then S to centre on it";
   const dBtn = document.createElement("button");
   dBtn.className = "dag-bankbtn d"; dBtn.type = "button"; dBtn.textContent = "D";
-  dBtn.title = "Bank D — D banks the selection, Alt+D clears it (click to clear)";
-  bar.appendChild(modeBtn); bar.appendChild(selInd); bar.appendChild(lrInd); bar.appendChild(udInd);
-  bar.appendChild(focusInd); bar.appendChild(aBtn); bar.appendChild(dBtn);
-  document.body.appendChild(bar);
+  dBtn.title = "Bank D — D banks/arms, Shift+D toggles membership, Alt+D clears, Ctrl+D/Ctrl+Shift+D wire it onto S as children, hold C then D to centre on it";
+  const editorInd = document.createElement("button");
+  editorInd.className = "dag-editorind"; editorInd.type = "button"; editorInd.textContent = "I";
+  editorInd.title = "New node editor — W opens, click toggles open/closed";
+  const delBtn = document.createElement("button");
+  delBtn.className = "dag-delbtn"; delBtn.type = "button"; delBtn.textContent = "Del";
+  delBtn.disabled = true;
+  delBtn.title = "Delete the selected node(s) — Delete key, or Shift+right-click a node to delete just it";
+
+  // Grouped into: state (LR/UD/selection), mode (U-I / Focus), banks (A/S/D),
+  // editing (editor toggle / delete) — each wrapped in its own bordered box.
+  const groupState = document.createElement("div");
+  groupState.className = "dag-bargroup";
+  groupState.append(lrInd, udInd, selInd);
+  const groupMode = document.createElement("div");
+  groupMode.className = "dag-bargroup";
+  groupMode.append(modeBtn, focusInd);
+  const groupBanks = document.createElement("div");
+  groupBanks.className = "dag-bargroup";
+  groupBanks.append(aBtn, sBtn, dBtn);
+  const groupEditing = document.createElement("div");
+  groupEditing.className = "dag-bargroup";
+  groupEditing.append(editorInd, delBtn);
+  bar.append(groupState, groupMode, groupBanks, groupEditing);
+  panelFooter.appendChild(bar);
   modeBtn.addEventListener("click", () => { selMode = selMode === "union" ? "intersection" : "union"; refresh(); });
-  aBtn.addEventListener("click", () => { bankA = null; paintBankBadges(); updateBar(); });
-  dBtn.addEventListener("click", () => { bankD = null; paintBankBadges(); updateBar(); });
+  aBtn.addEventListener("click", () => clearBankA());
+  sBtn.addEventListener("click", () => clearBankS());
+  dBtn.addEventListener("click", () => clearBankD());
+  sBtn.addEventListener("contextmenu", ev => { ev.preventDefault(); toggleDisableS(); });
+  editorInd.addEventListener("click", () => { if (editorOpen) closeEditor(); else openEditor(); });
+  delBtn.addEventListener("click", () => deleteNodes(selectedIds));
+
+  // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
+  // distinct from the coloured-drop-shadow/dotted-outline selection scheme.
+  const bankHover = (bank: Set<string> | null, on: boolean): void => {
+    if (!bank) return;
+    bank.forEach(id => nodes.get(id)?.el.classList.toggle("bank-hover", on));
+  };
+  aBtn.addEventListener("mouseenter", () => bankHover(bankA, true));
+  aBtn.addEventListener("mouseleave", () => bankHover(bankA, false));
+  dBtn.addEventListener("mouseenter", () => bankHover(bankD, true));
+  dBtn.addEventListener("mouseleave", () => bankHover(bankD, false));
+  sBtn.addEventListener("mouseenter", () => bankHover(bankSDisabled ? null : bankS, true));
+  sBtn.addEventListener("mouseleave", () => bankHover(bankSDisabled ? null : bankS, false));
+
+  // Would banking the current selection into `letter` fail — either because it
+  // overlaps a different bank, or because it would wire a future cycle?
+  const wouldReject = (letter: BankLetter): boolean =>
+    selectedIds.length > 0 && (otherBanksConflict(letter) || wouldCreateCycle(letter, selectedIds));
+  // A/D, once filled: what would Ctrl+<letter>'s wiring action onto S do right
+  // now? null = nothing special to report (no S target, or would do something
+  // useful); "advisory" = every prospective pair either exists already or is
+  // cycle-blocked, but at least one exists to remove in toggle mode (so this
+  // only really means "union mode would be a no-op"); "blocked" = every
+  // prospective pair is cycle-blocked and none exist — neither mode does
+  // anything at all.
+  function bankActionState(letter: "A" | "D"): "advisory" | "blocked" | null {
+    const src = letter === "A" ? bankA : bankD;
+    const target = effectiveS();
+    if (!src || !src.size || !target || !target.size) return null;
+    let anyAddable = false, anyRemovable = false, anyBlocked = false;
+    src.forEach(u => target.forEach(v => {
+      const [from, to] = letter === "A" ? [u, v] : [v, u];
+      if (hasEdge(from, to)) anyRemovable = true;
+      else if (ancOf.get(from)!.has(to)) anyBlocked = true;
+      else anyAddable = true;
+    }));
+    if (anyAddable) return null;
+    if (!anyRemovable && anyBlocked) return "blocked";
+    return anyRemovable || anyBlocked ? "advisory" : null;
+  }
 
   function updateBar(): void {
     modeBtn.textContent = selMode === "intersection" ? "I" : "U";
@@ -847,10 +1071,26 @@ function render(container: HTMLElement, g: GraphDef): void {
     selInd.textContent = t;
     lrInd.classList.toggle("off", !lrActive());
     udInd.classList.toggle("off", !udActive());
-    aBtn.classList.toggle("off", !bankA);
-    aBtn.classList.toggle("conflict", bankConflict(bankD));
-    dBtn.classList.toggle("off", !bankD);
-    dBtn.classList.toggle("conflict", bankConflict(bankA));
+    delBtn.disabled = !selectedIds.length;
+
+    const paintBank = (btn: HTMLButtonElement, letter: BankLetter, filled: boolean): void => {
+      btn.classList.toggle("off", !filled);
+      btn.classList.toggle("would-accept", !filled && selectedIds.length > 0 && !wouldReject(letter));
+      btn.classList.toggle("conflict", wouldReject(letter));
+      btn.classList.toggle("prospective", prospective === letter);
+      btn.classList.toggle("locked", prospective !== null && prospective !== letter);
+    };
+    paintBank(aBtn, "A", !!bankA);
+    paintBank(dBtn, "D", !!bankD);
+    paintBank(sBtn, "S", !!bankS);
+    sBtn.classList.toggle("disabled", bankSDisabled);
+
+    const aState = bankA ? bankActionState("A") : null;
+    const dState = bankD ? bankActionState("D") : null;
+    aBtn.classList.toggle("action-advisory", aState === "advisory");
+    aBtn.classList.toggle("action-blocked", aState === "blocked");
+    dBtn.classList.toggle("action-advisory", dState === "advisory");
+    dBtn.classList.toggle("action-blocked", dState === "blocked");
   }
 
   function updateFocusIndicator(): void {
@@ -878,8 +1118,6 @@ function render(container: HTMLElement, g: GraphDef): void {
   // updateScrollbarGeometry) shows/hides & repositions down to the current one.
   const domainFrac = (canvasX: number) => (canvasX - MARGIN) / scrollDomain;
 
-  const hscrollWrap = document.createElement("div");
-  hscrollWrap.className = "dag-hscroll-wrap";
   const hscrollTrack = document.createElement("div");
   hscrollTrack.className = "dag-hscroll";
   const hscrollTicks: HTMLDivElement[] = [];
@@ -901,8 +1139,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   const hscrollBox = document.createElement("div");
   hscrollBox.className = "dag-hscroll-box";
   hscrollTrack.appendChild(hscrollBox);
-  hscrollWrap.appendChild(hscrollTrack);
-  document.body.appendChild(hscrollWrap);
+  panelFooter.appendChild(hscrollTrack);
 
   // Grow the rank/scrollbar pools to cover a larger graph (addNode only ever
   // grows — a focused view narrows via `excluded` instead, never shrinking
@@ -1015,30 +1252,42 @@ function render(container: HTMLElement, g: GraphDef): void {
     const c = (Math.min(...cols) + Math.max(...cols)) / 2;   // true midpoint — may sit between two ranks
     setScrollExact(centerScrollFor(c));
   };
+  // Hold C, then A/S/D, then release C: centre on that bank's span instead of
+  // the current selection. Ranks come from currently-visible (non-excluded)
+  // members only.
+  const centerOnBank = (letter: BankLetter): void => {
+    const bank = bankOf(letter);
+    if (!bank) return;
+    const cols = Array.from(bank).map(id => rankMap.get(id)).filter((r): r is number => r !== undefined);
+    if (!cols.length) return;
+    const c = (Math.min(...cols) + Math.max(...cols)) / 2;
+    setScrollExact(centerScrollFor(c));
+  };
 
   // ---- Focus: push/pop a mask, narrowing the view to a selection's ancestry -
   let focusStack: Set<string>[] = [];
 
-  // Selected nodes union their ancestors — and, with `includeDotted`, every
-  // node whose ancestry is fully covered too — computed as in Union mode
-  // regardless of the current emphasis mode. Always an ancestor-closed subgraph.
-  function focusTargetSet(sel: string[], includeDotted: boolean): Set<string> {
-    const { green, dotted } = computeGreenAndDotted(sel, true);
+  // Selected nodes union their ancestors — computed as in Union mode
+  // regardless of the current emphasis mode. Always an ancestor-closed
+  // subgraph. (Pressing Space then F reaches the "include the frontier too"
+  // case this used to need a separate Shift+F for.)
+  function focusTargetSet(sel: string[]): Set<string> {
+    const { green } = computeGreenAndDotted(sel, true);
     const set = new Set<string>(sel);
     green.forEach(id => set.add(id));
-    if (includeDotted) dotted.forEach(id => set.add(id));
     return set;
   }
 
-  function pushFocus(includeDotted: boolean): void {
+  function pushFocus(): void {
     if (!selectedIds.length) return;
-    const target = focusTargetSet(selectedIds, includeDotted);
+    const target = focusTargetSet(selectedIds);
     const newExcluded = new Set<string>();
     g.nodes.forEach(n => { if (!target.has(n.id)) newExcluded.add(n.id); });
     const oldMaxRank = maxRank;
     focusStack.push(excluded);
     excluded = newExcluded;
     mode = "idle"; selectedIds = []; subBuffer = "";
+    clearAllBanks();
     const newMaxRank = relayout();
     if (newMaxRank < oldMaxRank) setScrollExact(centerScrollFor(newMaxRank));   // fewer ranks -> centre on the last one
     refresh();
@@ -1049,6 +1298,7 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (!focusStack.length) return;
     excluded = focusStack.pop()!;
     mode = "idle"; selectedIds = []; subBuffer = "";
+    clearAllBanks();
     relayout();                          // there are always at least as many ranks — no scroll adjustment needed
     refresh();
     updateFocusIndicator();
@@ -1123,10 +1373,22 @@ function render(container: HTMLElement, g: GraphDef): void {
   editorBody.className = "dag-nodebox-body"; editorBody.placeholder = "Body (optional)";
   const editorHint = document.createElement("div");
   editorHint.className = "dag-nodebox-hint";
-  editorHint.textContent = "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+W adds · Esc cancels";
+  editorHint.textContent = "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+Enter adds · Esc cancels";
+  const editorButtons = document.createElement("div");
+  editorButtons.className = "dag-nodebox-buttons";
+  const editorAddBtn = document.createElement("button");
+  editorAddBtn.type = "button"; editorAddBtn.className = "dag-nodebox-btn primary";
+  editorAddBtn.textContent = "Add Node"; editorAddBtn.tabIndex = -1;
+  const editorCancelBtn = document.createElement("button");
+  editorCancelBtn.type = "button"; editorCancelBtn.className = "dag-nodebox-btn";
+  editorCancelBtn.textContent = "Cancel"; editorCancelBtn.tabIndex = -1;
+  editorButtons.appendChild(editorAddBtn); editorButtons.appendChild(editorCancelBtn);
   editorBox.appendChild(flagA); editorBox.appendChild(flagD);
-  editorBox.appendChild(editorTitle); editorBox.appendChild(editorBody); editorBox.appendChild(editorHint);
-  document.body.appendChild(editorBox);
+  editorBox.appendChild(editorTitle); editorBox.appendChild(editorBody);
+  editorBox.appendChild(editorHint); editorBox.appendChild(editorButtons);
+  panelFooter.appendChild(editorBox);
+  editorAddBtn.addEventListener("click", () => commitEditor());
+  editorCancelBtn.addEventListener("click", () => closeEditor());
 
   function updateEditorFlags(): void {
     flagA.classList.toggle("on", editorUseA);
@@ -1135,15 +1397,17 @@ function render(container: HTMLElement, g: GraphDef): void {
   function openEditor(): void {
     if (editorOpen) return;
     editorOpen = true;
-    editorUseA = false; editorUseD = false;
+    editorUseA = !!bankA; editorUseD = !!bankD;   // default on if there's something to attach
     editorTitle.value = ""; editorBody.value = "";
     updateEditorFlags();
     editorBox.classList.add("open");
+    editorInd.classList.add("open");
     editorTitle.focus();
   }
   function closeEditor(): void {
     editorOpen = false;
     editorBox.classList.remove("open");
+    editorInd.classList.remove("open");
   }
   function commitEditor(): void {
     const title = editorTitle.value.trim();
@@ -1162,15 +1426,41 @@ function render(container: HTMLElement, g: GraphDef): void {
       ev.preventDefault();
       (document.activeElement === editorTitle ? editorBody : editorTitle).focus();
     } else if (ev.ctrlKey && (k === "a" || k === "A")) {
-      ev.preventDefault(); editorUseA = !editorUseA; updateEditorFlags();
+      ev.preventDefault();
+      // An empty bank can't be toggled on — instead, act as if A were pressed
+      // with the DAG in focus (banks the current selection, and toggles this
+      // same flag as a side effect of setBank).
+      if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
+      else pressBank("A");
     } else if (ev.ctrlKey && (k === "d" || k === "D")) {
-      ev.preventDefault(); editorUseD = !editorUseD; updateEditorFlags();
-    } else if (ev.ctrlKey && (k === "w" || k === "W")) {
+      ev.preventDefault();
+      if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
+      else pressBank("D");
+    } else if (ev.ctrlKey && k === "Enter") {
       ev.preventDefault(); commitEditor();
     } else if (k === "Escape") {
       ev.preventDefault(); closeEditor();
     }
   });
+
+  const addEdgeRaw = (from: string, to: string): void => { g.edges.push({ from, to }); };
+  const removeEdge = (from: string, to: string): void => {
+    const i = g.edges.findIndex(e => e.from === from && e.to === to);
+    if (i >= 0) g.edges.splice(i, 1);
+  };
+  const hasEdge = (from: string, to: string): boolean => g.edges.some(e => e.from === from && e.to === to);
+
+  // After `g.nodes`/`g.edges` change: recolour/redraw edges, recompute
+  // ancestor/descendant relations, grow the rank pools if the graph now needs
+  // more of them (it can only ever need more, never fewer), and relay out.
+  function syncGraphStructure(): void {
+    rebuildEdgeRecs();
+    rebuildRelations();
+    const newFullRankMap = computeRanks(g);
+    const newMaxRank0 = Math.max(...g.nodes.map(n => newFullRankMap.get(n.id)!));
+    if (newMaxRank0 > maxRank0) growRankPools(newMaxRank0);
+    relayout();
+  }
 
   // Add a new node to the (single, never-duplicated) graph `g`, wire it to
   // whatever's currently in banks A/D per the two flags, and bring the
@@ -1180,18 +1470,56 @@ function render(container: HTMLElement, g: GraphDef): void {
     const id = "N" + nextNodeSeq++;
     const def: NodeDef = { id, title, body: body || undefined };
     g.nodes.push(def);
-    if (useA && bankA) bankA.forEach(a => g.edges.push({ from: a, to: id }));
-    if (useD && bankD) bankD.forEach(d => g.edges.push({ from: id, to: d }));
+    if (useA && bankA) bankA.forEach(a => addEdgeRaw(a, id));
+    if (useD && bankD) bankD.forEach(d => addEdgeRaw(id, d));
 
     addNodeCard(def);
-    rebuildEdgeRecs();
-    rebuildRelations();
+    syncGraphStructure();
+    paintBankBadges();
+    refresh();
+  }
 
-    const newFullRankMap = computeRanks(g);
-    const newMaxRank0 = Math.max(...g.nodes.map(n => newFullRankMap.get(n.id)!));
-    if (newMaxRank0 > maxRank0) growRankPools(newMaxRank0);
+  // Ctrl+A / Ctrl+D with the DAG in focus: wire bank A on as parents of bank S
+  // (or bank D on as children), skipping any pair that would close a cycle.
+  // Toggle mode (default) removes an already-existing edge instead of adding
+  // it; union mode (Ctrl+Shift) only ever adds, leaving existing ones be.
+  function wireBankToS(source: "A" | "D", union: boolean): void {
+    const src = source === "A" ? bankA : bankD;
+    const target = effectiveS();
+    if (!src || !target || !src.size || !target.size) return;
+    let changed = false;
+    src.forEach(u => {
+      target.forEach(v => {
+        const [from, to] = source === "A" ? [u, v] : [v, u];   // A: u is v's parent; D: v is u's parent
+        if (hasEdge(from, to)) {
+          if (!union) { removeEdge(from, to); changed = true; }
+        } else if (!ancOf.get(from)!.has(to)) {                 // would `to` already be an ancestor of `from`?
+          addEdgeRaw(from, to); changed = true;
+        }
+      });
+    });
+    if (changed) { syncGraphStructure(); refresh(); }   // ancestor/descendant sets shift -> selection colours can too
+  }
 
-    relayout();
+  // ---- Delete: remove nodes from the graph, their banks, and the DOM -------
+  function deleteNodes(ids: string[]): void {
+    const idSet = new Set(ids.filter(id => nodes.has(id)));
+    if (!idSet.size) return;
+    g.nodes = g.nodes.filter(n => !idSet.has(n.id));
+    g.edges = g.edges.filter(e => !idSet.has(e.from) && !idSet.has(e.to));
+    idSet.forEach(id => {
+      nodes.get(id)!.el.remove();                 // takes its tally/badge children with it
+      nodes.delete(id);
+      nodeEnum.get(id)?.remove();
+      nodeEnum.delete(id);
+      nodeTally.delete(id);
+      nodeBank.delete(id);
+      removeFromBanks(id);
+    });
+    selectedIds = selectedIds.filter(id => !idSet.has(id));
+    if (!selectedIds.length) mode = "idle";
+    subBuffer = "";
+    syncGraphStructure();
     paintBankBadges();
     refresh();
   }
@@ -1204,10 +1532,16 @@ function render(container: HTMLElement, g: GraphDef): void {
     const id = ln.def.id;
     ln.el.addEventListener("click", ev => {
       ev.stopPropagation();
-      if (ev.shiftKey && mode === "nodes" && selectedIds.length) {
-        if (blockedSet.has(id) || selectedIds.includes(id)) return;   // barrier: an insensible pick
-        selectedIds = [...selectedIds, id];
-      } else if (!ev.shiftKey && mode === "nodes" && selectedIds.length === 1 && selectedIds[0] === id) {
+      // Prospective mode overrides Shift: every click just toggles membership.
+      const toggling = prospective !== null || (ev.shiftKey && mode === "nodes" && selectedIds.length);
+      if (toggling) {
+        if (selectedIds.includes(id)) {
+          selectedIds = selectedIds.filter(x => x !== id);           // already selected -> deselect
+        } else if (!blockedSet.has(id)) {
+          selectedIds = [...selectedIds, id];                        // barrier: an insensible pick
+        }
+        mode = selectedIds.length ? "nodes" : "idle";
+      } else if (selectedIds.length === 1 && selectedIds[0] === id) {
         selectedIds = []; mode = "idle";                              // toggle the sole selection off
       } else {
         selectedIds = [id]; mode = "nodes";                          // fresh single selection
@@ -1224,36 +1558,89 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (mode !== "idle") return;
       resetFocus();
     });
+    // Right-click: clear this node's bank membership. Shift+right-click:
+    // delete it outright, regardless of the current selection.
+    ln.el.addEventListener("contextmenu", ev => {
+      ev.preventDefault();
+      if (ev.shiftKey) { deleteNodes([id]); return; }
+      if (removeFromBanks(id)) { paintBankBadges(); updateBar(); }
+    });
   }
 
   // ---- Keyboard ------------------------------------------------------------
-  document.addEventListener("keydown", e => { if (e.key === "Shift" && !shiftHeld) { shiftHeld = true; updateCursors(); } });
-  document.addEventListener("keyup",   e => { if (e.key === "Shift") { shiftHeld = false; updateCursors(); } });
+  // Holding C then pressing A/S/D centres on that bank immediately; releasing
+  // C without ever having done so centres on the selection instead. Tracked
+  // here, independently of the bank keys' own handling below.
+  let heldC = false;
+  let cComboFired = false;   // a bank centred while this C hold is still down
+  document.addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    if (k === "shift") { if (!shiftHeld) { shiftHeld = true; updateCursors(); } return; }
+    if (k === "c") { if (!heldC) { heldC = true; cComboFired = false; } return; }
+    if (heldC && !e.ctrlKey && !e.altKey && !e.shiftKey && (k === "a" || k === "s" || k === "d")) {
+      e.preventDefault();
+      centerOnBank(k.toUpperCase() as BankLetter);
+      cComboFired = true;
+    }
+  });
+  document.addEventListener("keyup", e => {
+    const k = e.key.toLowerCase();
+    if (k === "shift") { shiftHeld = false; updateCursors(); return; }
+    if (k === "c") {
+      if (!cComboFired) centerOnSelection();
+      heldC = false; cComboFired = false;
+    }
+  });
+  window.addEventListener("blur", () => { heldC = false; cComboFired = false; });
 
   document.addEventListener("keydown", e => {
     const k = e.key;
-    if (k === "Shift") return;
+    if (k === "Shift" || k === "c" || k === "C") return;   // handled by the tracking listener above
 
-    // Global: manual scroll, centre, emphasis mode, and focus.
+    // A prospective bank takes over Esc/Enter before anything else does.
+    if (prospective !== null && k === "Escape") { e.preventDefault(); prospective = null; updateBar(); return; }
+    if (prospective !== null && k === "Enter")  { e.preventDefault(); commitProspective(); return; }
+
+    // Holding C takes priority over A/S/D's own bindings (see above).
+    if (heldC && !e.ctrlKey && !e.altKey && !e.shiftKey &&
+        (k === "a" || k === "A" || k === "s" || k === "S" || k === "d" || k === "D")) {
+      e.preventDefault();
+      return;
+    }
+
+    // Global: manual scroll, emphasis mode, and focus.
     if (e.altKey && k === "ArrowLeft")  { e.preventDefault(); setScroll(scrollCols - 1); return; }
     if (e.altKey && k === "ArrowRight") { e.preventDefault(); setScroll(scrollCols + 1); return; }
-    if (k === "c" || k === "C") { e.preventDefault(); centerOnSelection(); return; }
     if (k === "i" || k === "I") { e.preventDefault(); selMode = "intersection"; refresh(); return; }
     if (k === "u" || k === "U") { e.preventDefault(); selMode = "union"; refresh(); return; }
-    if (k === "f" || k === "F") { e.preventDefault(); if (e.altKey) popFocus(); else pushFocus(e.shiftKey); return; }
+    if (k === "f" || k === "F") { e.preventDefault(); if (e.shiftKey) popFocus(); else pushFocus(); return; }
     if (k === "a" || k === "A") {
       e.preventDefault();
-      if (e.altKey) { bankA = null; paintBankBadges(); updateBar(); }
-      else if (selectedIds.length && !bankConflict(bankD)) { bankA = new Set(selectedIds); paintBankBadges(); updateBar(); }
+      if (e.ctrlKey) { ensureBankS(); wireBankToS("A", e.shiftKey); }
+      else if (e.altKey) clearBankA();
+      else if (e.shiftKey) toggleBankMembership("A", selectedIds);
+      else pressBank("A");
       return;
     }
     if (k === "d" || k === "D") {
       e.preventDefault();
-      if (e.altKey) { bankD = null; paintBankBadges(); updateBar(); }
-      else if (selectedIds.length && !bankConflict(bankA)) { bankD = new Set(selectedIds); paintBankBadges(); updateBar(); }
+      if (e.ctrlKey) { ensureBankS(); wireBankToS("D", e.shiftKey); }
+      else if (e.altKey) clearBankD();
+      else if (e.shiftKey) toggleBankMembership("D", selectedIds);
+      else pressBank("D");
+      return;
+    }
+    if (k === "s" || k === "S") {
+      e.preventDefault();
+      if (e.altKey) clearBankS();
+      else if (e.ctrlKey) { /* reserved */ }
+      else if (e.shiftKey) toggleBankMembership("S", selectedIds);
+      else pressBank("S");
       return;
     }
     if ((k === "w" || k === "W") && !e.ctrlKey && !e.altKey) { e.preventDefault(); openEditor(); return; }
+
+    if (k === "Delete" && selectedIds.length) { e.preventDefault(); deleteNodes(selectedIds); return; }
 
     if (k === "Home") { e.preventDefault(); selectRankNodes(0); return; }
     if (k === "End")  { e.preventDefault(); selectRankNodes(maxRank); return; }
