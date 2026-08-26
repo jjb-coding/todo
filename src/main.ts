@@ -63,7 +63,7 @@ const PALETTE = ["#2563eb", "#e07b1a", "#0d9488", "#7c3aed"]; // blue, orange, t
 const HOVER = 0.42;                                    // hover effect strength (0..1)
 const DROP = "0 1px 2px #1b273312, 0 6px 14px -10px #1b273340"; // default node shadow
 const HL = { yellow: [245, 179, 1], green: [47, 158, 68], red: [224, 49, 49] };
-const DOTTED_COL = [27, 39, 51]; // neutral grey-black for the "all ancestors covered" outline
+const DOTTED_COL = [120, 128, 138]; // neutral grey for the "frontier" outline
 const NEUTRAL_COL = [[238, 242, 247], [231, 236, 243]]; // even, odd column bg
 function tintCol(region: "anc" | "self" | "desc", parity: number): number[] {
   if (region === "anc")  return parity ? [214, 236, 223] : [224, 242, 231];
@@ -561,9 +561,10 @@ function render(container: HTMLElement, g: GraphDef): void {
   }
 
   // Ancestor counts (kept-threshold Set, respecting selMode unless `forceUnion`)
-  // plus the transitive "dotted" set: every included, non-selected node whose
-  // every (included) parent is itself selected, green, or already dotted.
-  // Ranks give a topological order, so a single ascending pass suffices.
+  // plus the "dotted" frontier: every node that is neither selected nor green,
+  // but whose *immediate* parents are all selected or green. Single pass, not
+  // transitive — a dotted node's own parents must already be covered, so it
+  // never in turn helps cover anyone else.
   function computeGreenAndDotted(sel: string[], forceUnion: boolean): {
     greenCount: Map<string, number>; green: Set<string>; dotted: Set<string>;
   } {
@@ -575,16 +576,13 @@ function render(container: HTMLElement, g: GraphDef): void {
     const green = new Set<string>();
     greenCount.forEach((v, k) => { if (v >= gThresh) green.add(k); });
 
+    const covered = (id: string) => selSet.has(id) || green.has(id);
     const dotted = new Set<string>();
-    const covered = (id: string) => selSet.has(id) || green.has(id) || dotted.has(id);
-    const orderedIds = [...nodes.keys()]
-      .filter(id => included(id))
-      .sort((a, b) => rankMap.get(a)! - rankMap.get(b)!);
-    for (const id of orderedIds) {
-      if (selSet.has(id)) continue;
+    nodes.forEach((_ln, id) => {
+      if (!included(id) || covered(id)) return;
       const ps = parents.get(id)!.filter(p => included(p));
       if (ps.length && ps.every(covered)) dotted.add(id);
-    }
+    });
     return { greenCount, green, dotted };
   }
 
@@ -1028,6 +1026,14 @@ function render(container: HTMLElement, g: GraphDef): void {
     selectedIds = [down ? order[0] : order[order.length - 1]];
     mode = "nodes"; refresh(); reveal();
   };
+  // Space: advance the selection from the selected (yellow) nodes to the
+  // frontier (dotted) nodes just beyond them.
+  const advance = (): void => {
+    const { dotted } = computeGreenAndDotted(selectedIds, false);
+    if (!dotted.size) return;
+    selectedIds = [...dotted]; mode = "nodes"; subBuffer = "";
+    refresh(); reveal();
+  };
 
   // ---- Sub-selection (type a number to isolate one node) -------------------
   function subDigit(d: string): void {
@@ -1119,6 +1125,7 @@ function render(container: HTMLElement, g: GraphDef): void {
         return;
       }
       if (selectedIds.length >= 2 && /^[0-9]$/.test(k))  { e.preventDefault(); startSubselect(k); }
+      if (k === " ") { e.preventDefault(); advance(); return; }
       if (r === null) return;                       // multi-rank selection: only Esc/Home/End act
       if (k === "ArrowLeft")       { e.preventDefault(); moveRankSel(-1); }
       else if (k === "ArrowRight") { e.preventDefault(); moveRankSel(1); }
