@@ -1,0 +1,142 @@
+:root {
+  --bg: #0f1720;
+  --panel: #f6f8fb;
+  --col-a: #eef2f7;
+  --col-b: #e7ecf3;
+  --node-bg: #ffffff;
+  --node-border: #c8d2de;
+  --node-title: #1b2733;
+  --node-body: #55606c;
+  --ink: #cfd8e3;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  padding: 28px;
+}
+
+#scroll {
+  max-width: 1100px;
+  margin: 0 auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--panel);
+  border-radius: 12px;
+  box-shadow: 0 1px 0 #ffffff10, 0 20px 40px -20px #0008;
+  padding: 8px;
+}
+#stage { position: relative; margin: 0 auto; }
+
+.dag-node {
+  position: absolute;
+  background: var(--node-bg);
+  border: 1px solid var(--node-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 1px 2px #1b273312, 0 6px 14px -10px #1b273340;
+  overflow: hidden;
+  user-select: none; -webkit-user-select: none;
+}
+.dag-node-title { font-size: 13.5px; font-weight: 650; color: var(--node-title); line-height: 1.25; }
+.dag-node-body { font-size: 12px; color: var(--node-body); line-height: 1.4; margin-top: 5px; }
+.dag-rank-label {
+  position: absolute; box-sizing: border-box;
+  height: 26px; line-height: 26px; padding-left: 34px;   /* 34 = H_PAD, aligns with node text */
+  font-size: 11px; font-weight: 600; letter-spacing: .3px;
+  color: #90a0b2; text-transform: uppercase; cursor: pointer; border-radius: 6px;
+  user-select: none; -webkit-user-select: none;
+}
+.dag-tally {
+  position: absolute; top: 5px; right: 6px;
+  padding: 1px 3px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.72);
+  display: none; line-height: 0; pointer-events: none;
+}
+.dag-enum {
+  position: absolute; display: none; pointer-events: none;
+  font-size: 10px; font-weight: 700; letter-spacing: .5px;
+  color: #5b6b7a; opacity: .55; font-variant-numeric: tabular-nums;
+}
+.dag-statusbar {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 8px; align-items: center; z-index: 50;
+  background: rgba(20, 28, 38, 0.92); color: #e8eef5;
+  padding: 6px 8px; border-radius: 12px;
+  box-shadow: 0 8px 24px -8px #0009; user-select: none;
+}
+.dag-statusbar .dag-modebtn {
+  width: 30px; height: 28px; border-radius: 8px; cursor: pointer;
+  border: 1px solid #3a4a5c; background: #223143; color: #e8eef5;
+  font-weight: 700; font-size: 14px; font-family: inherit;
+}
+.dag-statusbar .dag-modebtn.on { background: #b7791f; border-color: #d9a441; color: #1b1200; }
+.dag-statusbar .dag-selind {
+  min-width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; background: #182430; border: 1px solid #2a3a4c; font-weight: 700; font-size: 14px;
+}
+.dag-statusbar .dag-navind {
+  min-width: 28px; height: 28px; padding: 0 6px; display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; background: #182430; border: 1px solid #2a3a4c;
+  font-weight: 700; font-size: 11px; letter-spacing: .5px; color: #e8eef5;
+}
+.dag-statusbar .dag-navind.off { color: #4c5866; background: #131c26; border-color: #202c3a; }
+.dag-statusbar .dag-focusind {
+  position: relative;
+  min-width: 28px; height: 28px; padding: 0 8px; display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; background: #182430; border: 1px solid #2a3a4c; font-weight: 700; font-size: 14px; color: #e8eef5;
+}
+.dag-statusbar .dag-focusind.off { color: #4c5866; background: #131c26; border-color: #202c3a; }
+.dag-focus-depth {
+  position: absolute; top: -6px; right: -6px; line-height: 1.3;
+  font-size: 10px; font-weight: 700; letter-spacing: .5px;
+  color: #5b6b7a; opacity: .55; font-variant-numeric: tabular-nums;
+  background: rgba(20, 28, 38, 0.92); border-radius: 6px; padding: 0 3px;
+}
+.dag-focusind.off .dag-focus-depth { opacity: .3; }
+.dag-hscroll-wrap {
+  position: fixed; left: 0; right: 0; bottom: 64px;
+  display: flex; justify-content: center;
+  padding: 0 28px; z-index: 49;
+  pointer-events: none;
+}
+.dag-hscroll {
+  pointer-events: auto;
+  position: relative;
+  width: 100%; max-width: 1100px; height: 20px;
+  background: rgba(20, 28, 38, 0.92);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px -8px #0009;
+  overflow: hidden;
+}
+.dag-hscroll-border {
+  position: absolute; top: 5px; bottom: 5px; width: 1px;
+  transform: translateX(-50%);
+  background: rgba(168, 85, 247, 0.55);
+}
+.dag-hscroll-tick {
+  position: absolute; top: 3px; bottom: 3px; width: 1px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 1px;
+}
+.dag-hscroll-tick.current {
+  top: 2px; bottom: 2px; width: 2px;
+  background: rgba(255, 255, 255, 0.65);
+}
+.dag-hscroll-tick.target {
+  top: 1px; bottom: 1px; width: 4px;
+  background: #f5b301;
+  box-shadow: 0 0 5px rgba(245, 179, 1, 0.85);
+}
+.dag-hscroll-box {
+  position: absolute; top: 2px; bottom: 2px; min-width: 10px;
+  background: rgba(245, 179, 1, 0.35);
+  border: 1px solid rgba(245, 179, 1, 0.65);
+  border-radius: 6px; box-sizing: border-box;
+  cursor: grab; touch-action: none;
+}
+.dag-hscroll-box.dragging { cursor: grabbing; background: rgba(245, 179, 1, 0.5); }
+#err { color: #ff8a8a; font-family: ui-monospace, monospace; white-space: pre-wrap; padding: 12px; }
