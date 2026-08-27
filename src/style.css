@@ -129,6 +129,7 @@ body {
   cursor: not-allowed; color: #aab4c0; background: #eef1f5; border-color: #dde3ea;
 }
 .dag-statusbar .dag-modebtn.on { background: #b7791f; border-color: #d9a441; color: #1b1200; }
+.dag-statusbar .dag-modebtn.edit { background: #2563eb; border-color: #1d4fc4; color: #eef4ff; }
 .dag-statusbar .dag-selind {
   min-width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
   border-radius: 8px; background: var(--col-a); border: 1px solid var(--node-border);

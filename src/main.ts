@@ -550,7 +550,10 @@ function render(container: HTMLElement, g: GraphDef): void {
   let blockedSet = new Set<string>();   // already-emphasised nodes: can't be shift-added
   let barredSet = new Set<string>();    // green/red only — drives the "not-allowed" cursor
   let shiftHeld = false;
-  let selMode: "union" | "intersection" = "union";
+  // "edit" replaces ancestor/descendant emphasis with three independent,
+  // directly-clicked node selections (green/red/yellow = A/D/S) — see
+  // applyEditFocus() and editBankClick().
+  let selMode: "union" | "intersection" | "edit" = "union";
 
   // The barrier cursor only signals that adding a green/red node is blocked —
   // toggling (Shift, or prospective mode overriding it) an already-selected
@@ -704,6 +707,45 @@ function render(container: HTMLElement, g: GraphDef): void {
     updateCursors();
   }
 
+  // Edit mode's rendering: just the three bank rings, full strength, with no
+  // ancestor/descendant computation at all — there's no single "selection" to
+  // compute a cone from, only three independent node sets.
+  function applyEditFocus(): void {
+    resetFocus();
+    const paint = (bank: Set<string> | null, color: number[]): void => {
+      bank?.forEach(id => {
+        if (!included(id)) return;
+        const ln = nodes.get(id); if (!ln) return;
+        ln.el.style.boxShadow = ringShadow(rgbaStr(color, 0.85), 2.6, 0.4);
+        ln.el.style.opacity = "1";
+      });
+    };
+    paint(bankA, HL.green);
+    paint(bankD, HL.red);
+    paint(bankS, HL.yellow);
+  }
+  // M / the mode button: cycle Union -> Intersection -> Edit -> Union. Banks
+  // A/S/D are shared state either way (Edit mode just populates them by
+  // clicking instead of select-then-press), so nothing needs clearing here.
+  function cycleSelMode(): void {
+    const next = selMode === "union" ? "intersection" : selMode === "intersection" ? "edit" : "union";
+    // S can't be disabled while it's a live edit-mode target — remember
+    // whatever it was set to, force it enabled for the duration (still via
+    // toggleDisableS here, before selMode flips, so its own edit-mode guard
+    // doesn't block it), and put it back exactly as found on the way out.
+    if (next === "edit" && selMode !== "edit") {
+      bankSDisabledBeforeEdit = bankSDisabled;
+      if (bankSDisabled) toggleDisableS();
+    } else if (selMode === "edit" && next !== "edit" && bankSDisabledBeforeEdit) {
+      stripBankHover(bankS);   // re-disabling always empties S, same as toggleDisableS
+      bankSDisabled = true;
+      bankS = null;
+      paintBankBadges();
+    }
+    selMode = next;
+    refresh();
+  }
+
   // ---- Interaction state ---------------------------------------------------
   type Mode = "idle" | "nodes" | "rank" | "subselect";
   let mode: Mode = "idle";
@@ -722,6 +764,9 @@ function render(container: HTMLElement, g: GraphDef): void {
   // Right-click on S deactivates it: emptied, and the Ctrl+A/Ctrl+D wiring
   // actions fall back to using the current selection directly instead of S.
   let bankSDisabled = false;
+  // Remembers bankSDisabled across a trip through Edit mode (where it's
+  // always forced off) — see cycleSelMode.
+  let bankSDisabledBeforeEdit = false;
   // Pressing a bank key with nothing selected arms it, waiting for a selection
   // to bank (and deselect) on the next press — instead of banking immediately.
   let prospective: BankLetter | null = null;
@@ -730,10 +775,10 @@ function render(container: HTMLElement, g: GraphDef): void {
     letter === "A" ? bankA : letter === "D" ? bankD : bankS;
   // A node can only ever belong to one bank — this is what blocks banking a
   // selection that overlaps a *different* bank.
-  const bankConflict = (bank: Set<string> | null): boolean =>
-    !!bank && selectedIds.some(id => bank.has(id));
-  const otherBanksConflict = (letter: BankLetter): boolean =>
-    (["A", "D", "S"] as BankLetter[]).some(l => l !== letter && bankConflict(bankOf(l)));
+  const bankConflict = (bank: Set<string> | null, sel: string[]): boolean =>
+    !!bank && sel.some(id => bank.has(id));
+  const otherBanksConflict = (letter: BankLetter, sel: string[]): boolean =>
+    (["A", "D", "S"] as BankLetter[]).some(l => l !== letter && bankConflict(bankOf(l), sel));
   // A/D feed a new node's ancestors/descendants, and A/D also wire directly
   // onto S (see wireBankToS) — so banking any of the three while another
   // already holds an ancestor/descendant of the incoming selection would wire
@@ -753,8 +798,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   // always allowed.
   function prospectiveBlocked(id: string): boolean {
     if (prospective === null || selectedIds.includes(id)) return false;
-    if ((["A", "D", "S"] as BankLetter[]).some(l => l !== prospective && bankOf(l)?.has(id))) return true;
-    return wouldCreateCycle(prospective, [id]);
+    return otherBanksConflict(prospective, [id]) || wouldCreateCycle(prospective, [id]);
   }
   function paintBankBadges(): void {
     nodes.forEach((_ln, id) => {
@@ -765,28 +809,37 @@ function render(container: HTMLElement, g: GraphDef): void {
       else { badge.style.display = "none"; }
     });
   }
-  // Clearing A/D also switches off the editor's matching toggle, if it was on.
+  // A bank's icon can be mid-hover (cross-hatch applied to its members) at
+  // the moment the bank is cleared by a click on that same icon — the
+  // matching mouseleave never runs, since the icon doesn't actually move, so
+  // its members would otherwise be stuck cross-hatched forever. Every path
+  // that empties a bank strips it first.
+  const stripBankHover = (bank: Set<string> | null): void => {
+    bank?.forEach(id => nodes.get(id)?.el.classList.remove("bank-hover"));
+  };
+  // Clearing A/D also switches off the editor's matching toggle, if it was
+  // on. refresh() (not just paintBankBadges/updateBar) matters here because
+  // edit mode's node rings are painted directly from bank contents.
   function clearBankA(): void {
+    stripBankHover(bankA);
     bankA = null;
     if (editorUseA) { editorUseA = false; updateEditorFlags(); }
-    paintBankBadges(); updateBar();
+    paintBankBadges(); refresh();
   }
   function clearBankD(): void {
+    stripBankHover(bankD);
     bankD = null;
     if (editorUseD) { editorUseD = false; updateEditorFlags(); }
-    paintBankBadges(); updateBar();
+    paintBankBadges(); refresh();
   }
-  function clearBankS(): void { bankS = null; paintBankBadges(); updateBar(); }
+  function clearBankS(): void { stripBankHover(bankS); bankS = null; paintBankBadges(); refresh(); }
   // Right-click: toggle S disabled/enabled, always emptying it in the process.
-  // If S's icon was mid-hover (cross-hatch applied) when this fires, the
-  // matching mouseleave never runs because bankS is already gone by then —
-  // so its members would be stuck cross-hatched forever. Clear it here first.
   function toggleDisableS(): void {
-    const prevS = bankS;
+    if (selMode === "edit") return;   // S can't be disabled while it's a live edit-mode target
+    stripBankHover(bankS);
     bankSDisabled = !bankSDisabled;
     bankS = null;
-    if (prevS) prevS.forEach(id => nodes.get(id)?.el.classList.remove("bank-hover"));
-    paintBankBadges(); updateBar();
+    paintBankBadges(); refresh();
   }
   // The set wireBankToS should treat as "S" — the real bank, unless it's been
   // disabled, in which case the current selection stands in for it directly
@@ -815,17 +868,28 @@ function render(container: HTMLElement, g: GraphDef): void {
   }
 
   // Try to bank `sel` into the given letter. Fails silently (returns false) on
-  // a cross-bank conflict or a would-be A/D cycle. Setting A/D also toggles
-  // the editor's matching attach flag, mirroring Ctrl+A/Ctrl+D in the editor.
-  function setBank(letter: BankLetter, sel: string[]): boolean {
-    if (otherBanksConflict(letter)) return false;
+  // a cross-bank conflict or a would-be A/D cycle.
+  function setBankRaw(letter: BankLetter, sel: string[]): boolean {
+    if (otherBanksConflict(letter, sel)) return false;
     if (wouldCreateCycle(letter, sel)) return false;
     const set = new Set(sel);
-    if (letter === "A") { bankA = set; editorUseA = !editorUseA; updateEditorFlags(); }
-    else if (letter === "D") { bankD = set; editorUseD = !editorUseD; updateEditorFlags(); }
-    else { bankS = set; }
+    if (letter === "A") bankA = set;
+    else if (letter === "D") bankD = set;
+    else bankS = set;
     paintBankBadges(); updateBar();
     return true;
+  }
+  // As setBankRaw, but also toggles the editor's matching attach flag —
+  // mirroring Ctrl+A/Ctrl+D in the editor. Used by the keyboard-driven commit
+  // path (pressBank/commitProspective); edit-mode clicks use setBankRaw
+  // directly, since flipping that flag on every click would be nonsensical.
+  function setBank(letter: BankLetter, sel: string[]): boolean {
+    const ok = setBankRaw(letter, sel);
+    if (ok) {
+      if (letter === "A") { editorUseA = !editorUseA; updateEditorFlags(); }
+      else if (letter === "D") { editorUseD = !editorUseD; updateEditorFlags(); }
+    }
+    return ok;
   }
   // The full behaviour of pressing a bank key with the DAG in focus: arms
   // prospective mode when nothing's selected, or banks immediately otherwise.
@@ -833,17 +897,16 @@ function render(container: HTMLElement, g: GraphDef): void {
   // commits it (see the keydown handler) and Esc cancels it, regardless of
   // which bank is armed.
   function pressBank(letter: BankLetter): void {
+    if (selMode === "edit") return;   // edit mode banks via direct clicks, never prospective
     if (prospective !== null) return;
     if (letter === "S" && bankSDisabled) return;
     if (!selectedIds.length) { prospective = letter; updateBar(); updateCursors(); return; }
     setBank(letter, selectedIds);
   }
-  // Shift+letter: XOR the current selection's membership in that bank instead
-  // of overwriting it. Each node is still subject to the usual cross-bank and
-  // cycle checks (individually — only the nodes that pass are toggled in).
-  function toggleBankMembership(letter: BankLetter, sel: string[]): void {
-    if (prospective !== null || !sel.length) return;
-    if (letter === "S" && bankSDisabled) return;
+  // XOR `sel`'s membership into `letter`'s bank, individually gated by the
+  // usual cross-bank/cycle checks (only the nodes that pass are toggled in).
+  // Returns whether anything actually changed.
+  function toggleBankMembershipRaw(letter: BankLetter, sel: string[]): boolean {
     const cur = bankOf(letter);
     const next = cur ? new Set(cur) : new Set<string>();
     let changed = false;
@@ -853,12 +916,23 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (conflicts || wouldCreateCycle(letter, [id])) return;
       next.add(id); changed = true;
     });
-    if (!changed) return;
+    if (!changed) return false;
     const result = next.size ? next : null;
-    if (letter === "A") { bankA = result; editorUseA = !editorUseA; updateEditorFlags(); }
-    else if (letter === "D") { bankD = result; editorUseD = !editorUseD; updateEditorFlags(); }
-    else { bankS = result; }
+    if (letter === "A") bankA = result;
+    else if (letter === "D") bankD = result;
+    else bankS = result;
     paintBankBadges(); updateBar();
+    return true;
+  }
+  // Shift+letter: as toggleBankMembershipRaw, but also toggles the editor's
+  // matching attach flag — the keyboard-driven commit path only.
+  function toggleBankMembership(letter: BankLetter, sel: string[]): void {
+    if (selMode === "edit" || prospective !== null || !sel.length) return;
+    if (letter === "S" && bankSDisabled) return;
+    if (toggleBankMembershipRaw(letter, sel)) {
+      if (letter === "A") { editorUseA = !editorUseA; updateEditorFlags(); }
+      else if (letter === "D") { editorUseD = !editorUseD; updateEditorFlags(); }
+    }
   }
   // Enter, while a bank is armed: commit its selection, deselecting on success.
   // A failed attempt (conflict/cycle) or an empty selection leaves it armed.
@@ -890,13 +964,18 @@ function render(container: HTMLElement, g: GraphDef): void {
     byRank[r].slice().sort((a, b) => a.y - b.y).map(ln => ln.def.id);
 
   // Whether Left/Right or Up/Down currently do anything, given the selection.
+  // Edit mode has no single coherent "selection" to move along ranks with —
+  // up to three independent bank selections instead — so neither ever
+  // applies there, except when a whole rank is explicitly selected.
   const lrActive = (): boolean => {
     if (mode === "rank") return true;
+    if (selMode === "edit") return false;
     if (mode === "nodes") return singularRank() !== null;
     return false;
   };
   const udActive = (): boolean => {
     if (mode === "rank") return true;
+    if (selMode === "edit") return false;
     if (mode === "nodes" && selectedIds.length === 1) return true;
     return false;
   };
@@ -960,8 +1039,9 @@ function render(container: HTMLElement, g: GraphDef): void {
 
   // One renderer for whatever mode we're in.
   function refresh(): void {
-    if (mode === "idle") { resetFocus(); updateBar(); syncEditor(); return; }
     if (mode === "rank") { resetFocus(); renderRank(rankSel); updateBar(); syncEditor(); return; }
+    if (selMode === "edit") { applyEditFocus(); updateBar(); syncEditor(); return; }
+    if (mode === "idle") { resetFocus(); updateBar(); syncEditor(); return; }
     applyFocus(selectedIds, 1, true);            // "nodes" or "subselect"
     if (selectedIds.length >= 2) {
       renderEnum();
@@ -976,7 +1056,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   bar.className = "dag-statusbar";
   const modeBtn = document.createElement("button");
   modeBtn.className = "dag-modebtn"; modeBtn.type = "button";
-  modeBtn.title = "Emphasis mode — Union / Intersection (click, or press U / I)";
+  modeBtn.title = "Selection mode — Union / Intersection / Edit (click, or press M to cycle)";
   const selInd = document.createElement("div");
   selInd.className = "dag-selind";
   selInd.title = "Selection: ∅ none · R rank · S single node · C nodes in one rank · M nodes across ranks";
@@ -1031,7 +1111,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   groupEditing.append(editorInd, delBtn);
   bar.append(groupState, groupMode, groupBanks, groupEditing);
   panelFooter.appendChild(bar);
-  modeBtn.addEventListener("click", () => { selMode = selMode === "union" ? "intersection" : "union"; refresh(); });
+  modeBtn.addEventListener("click", () => cycleSelMode());
   aBtn.addEventListener("click", () => clearBankA());
   sBtn.addEventListener("click", () => clearBankS());
   dBtn.addEventListener("click", () => clearBankD());
@@ -1055,7 +1135,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   // Would banking the current selection into `letter` fail — either because it
   // overlaps a different bank, or because it would wire a future cycle?
   const wouldReject = (letter: BankLetter): boolean =>
-    selectedIds.length > 0 && (otherBanksConflict(letter) || wouldCreateCycle(letter, selectedIds));
+    selectedIds.length > 0 && (otherBanksConflict(letter, selectedIds) || wouldCreateCycle(letter, selectedIds));
   // A/D, once filled: what would Ctrl+<letter>'s wiring action onto S do right
   // now? null = nothing special to report (no S target, or would do something
   // useful); "advisory" = every prospective pair either exists already or is
@@ -1080,23 +1160,25 @@ function render(container: HTMLElement, g: GraphDef): void {
   }
 
   function updateBar(): void {
-    modeBtn.textContent = selMode === "intersection" ? "I" : "U";
+    modeBtn.textContent = selMode === "intersection" ? "I" : selMode === "edit" ? "E" : "U";
     modeBtn.classList.toggle("on", selMode === "intersection");
+    modeBtn.classList.toggle("edit", selMode === "edit");
     let t = "∅";
     if (mode === "rank") t = "R";
-    else if (mode === "nodes" || mode === "subselect")
+    else if (selMode !== "edit" && (mode === "nodes" || mode === "subselect"))
       t = selectedIds.length === 1 ? "S" : (singularRank() !== null ? "C" : "M");
     selInd.textContent = t;
     lrInd.classList.toggle("off", !lrActive());
     udInd.classList.toggle("off", !udActive());
     delBtn.disabled = !selectedIds.length;
 
+    const editMode = selMode === "edit";
     const paintBank = (btn: HTMLButtonElement, letter: BankLetter, filled: boolean): void => {
       btn.classList.toggle("off", !filled);
-      btn.classList.toggle("would-accept", !filled && selectedIds.length > 0 && !wouldReject(letter));
-      btn.classList.toggle("conflict", wouldReject(letter));
-      btn.classList.toggle("prospective", prospective === letter);
-      btn.classList.toggle("locked", prospective !== null && prospective !== letter);
+      btn.classList.toggle("would-accept", !editMode && !filled && selectedIds.length > 0 && !wouldReject(letter));
+      btn.classList.toggle("conflict", !editMode && wouldReject(letter));
+      btn.classList.toggle("prospective", !editMode && prospective === letter);
+      btn.classList.toggle("locked", !editMode && prospective !== null && prospective !== letter);
     };
     paintBank(aBtn, "A", !!bankA);
     paintBank(dBtn, "D", !!bankD);
@@ -1637,6 +1719,46 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (changed) { syncGraphStructure(); refresh(); }   // ancestor/descendant sets shift -> selection colours can too
   }
 
+  // Edit mode only: A/D wire onto S the instant both sides have members —
+  // no manual Ctrl+A/Ctrl+D commit needed. Only ever adds (skipping anything
+  // that already exists or would close a cycle), so it's safe to call after
+  // every bank-selection change, whichever bank changed.
+  function applyEditWiring(): void {
+    if (selMode !== "edit") return;
+    let changed = false;
+    if (bankA && bankS) {
+      bankA.forEach(a => bankS!.forEach(s => {
+        if (!hasEdge(a, s) && !ancOf.get(a)!.has(s)) { addEdgeRaw(a, s); changed = true; }
+      }));
+    }
+    if (bankD && bankS) {
+      bankS.forEach(s => bankD!.forEach(d => {
+        if (!hasEdge(s, d) && !ancOf.get(s)!.has(d)) { addEdgeRaw(s, d); changed = true; }
+      }));
+    }
+    if (changed) syncGraphStructure();
+  }
+  // Edit mode's per-click handler: a plain click replaces `letter`'s bank
+  // with just this node (or clears it, if it was already the sole member) —
+  // Shift toggles membership instead, same as toggleBankMembership. Either
+  // way, immediately re-applies any newly-possible A->S / S->D wiring.
+  function editBankClick(letter: BankLetter, id: string, shift: boolean): void {
+    if (letter === "S" && bankSDisabled) return;
+    if (shift) {
+      toggleBankMembershipRaw(letter, [id]);
+    } else {
+      const cur = bankOf(letter);
+      if (cur && cur.size === 1 && cur.has(id)) {
+        // Sole member clicked again -> clear, same as Alt+<letter>.
+        if (letter === "A") clearBankA(); else if (letter === "D") clearBankD(); else clearBankS();
+      } else {
+        setBankRaw(letter, [id]);
+      }
+    }
+    applyEditWiring();
+    refresh();
+  }
+
   // ---- Delete: remove nodes from the graph, their banks, and the DOM -------
   function deleteNodes(ids: string[]): void {
     const idSet = new Set(ids.filter(id => nodes.has(id)));
@@ -1668,6 +1790,9 @@ function render(container: HTMLElement, g: GraphDef): void {
     const id = ln.def.id;
     ln.el.addEventListener("click", ev => {
       ev.stopPropagation();
+      // Edit mode: left-click is green/A, entirely independent of the
+      // normal ancestor/descendant selection flow below.
+      if (selMode === "edit") { editBankClick("A", id, ev.shiftKey); return; }
       // Prospective mode overrides Shift: every click just toggles membership.
       const toggling = prospective !== null || (ev.shiftKey && mode === "nodes" && selectedIds.length);
       if (toggling) {
@@ -1687,18 +1812,31 @@ function render(container: HTMLElement, g: GraphDef): void {
       else { refresh(); applyFocus([id], HOVER, false); }            // deselected but still hovering
     });
     ln.el.addEventListener("mouseenter", () => {
+      if (selMode === "edit") return;                                // no hover preview in edit mode
       if (mode !== "idle") { updateCursors(); return; }              // a committed view is frozen
       applyFocus([id], HOVER, false);
     });
     ln.el.addEventListener("mouseleave", () => {
-      if (mode !== "idle") return;
+      if (selMode === "edit" || mode !== "idle") return;
       resetFocus();
     });
-    // Right-click: clear this node's bank membership. Shift+right-click:
-    // delete it outright, regardless of the current selection.
+    // Edit mode: middle-click is yellow/S. Middle-click never fires "click",
+    // so it's caught on mousedown instead (also preventing its usual
+    // autoscroll gesture).
+    ln.el.addEventListener("mousedown", ev => {
+      if (selMode === "edit" && ev.button === 1) {
+        ev.preventDefault();
+        editBankClick("S", id, ev.shiftKey);
+      }
+    });
+    // Right-click: in edit mode, red/D (its usual meaning is replaced, as
+    // noted in the mode's own docs). Otherwise: clear this node's bank
+    // membership. Shift+right-click always deletes it outright, in every
+    // mode, regardless of the current selection.
     ln.el.addEventListener("contextmenu", ev => {
       ev.preventDefault();
       if (ev.shiftKey) { deleteNodes([id]); return; }
+      if (selMode === "edit") { editBankClick("D", id, false); return; }
       if (removeFromBanks(id)) { paintBankBadges(); updateBar(); }
     });
   }
@@ -1753,9 +1891,15 @@ function render(container: HTMLElement, g: GraphDef): void {
     // Global: manual scroll, emphasis mode, and focus.
     if (e.altKey && k === "ArrowLeft")  { e.preventDefault(); setScroll(scrollCols - 1); return; }
     if (e.altKey && k === "ArrowRight") { e.preventDefault(); setScroll(scrollCols + 1); return; }
-    if (k === "i" || k === "I") { e.preventDefault(); selMode = "intersection"; refresh(); return; }
-    if (k === "u" || k === "U") { e.preventDefault(); selMode = "union"; refresh(); return; }
-    if (k === "f" || k === "F") { e.preventDefault(); if (e.shiftKey) popFocus(); else pushFocus(); return; }
+    if (k === "m" || k === "M") { e.preventDefault(); cycleSelMode(); return; }
+    // Push needs an ancestry to narrow into, which edit mode has none of;
+    // popping back out (staying in edit mode) is still fine.
+    if (k === "f" || k === "F") {
+      e.preventDefault();
+      if (e.shiftKey) popFocus();
+      else if (selMode !== "edit") pushFocus();
+      return;
+    }
     if (k === "a" || k === "A") {
       e.preventDefault();
       if (e.ctrlKey) { ensureBankS(); wireBankToS("A", e.shiftKey); }
@@ -1786,6 +1930,17 @@ function render(container: HTMLElement, g: GraphDef): void {
 
     if (k === "Home") { e.preventDefault(); selectRankNodes(0); return; }
     if (k === "End")  { e.preventDefault(); selectRankNodes(maxRank); return; }
+
+    // Edit mode's selections live entirely in the banks, with no "mode" of
+    // their own (mode stays "idle") — so Esc needs its own case here, rather
+    // than falling into the idle/nodes/rank handling below.
+    if (k === "Escape" && selMode === "edit" && mode === "idle") {
+      e.preventDefault();
+      bankA = null; bankD = null; bankS = null;
+      editorUseA = false; editorUseD = false; updateEditorFlags();
+      paintBankBadges(); refresh();
+      return;
+    }
 
     if (mode === "subselect") {
       if (k === "Escape")         { e.preventDefault(); exitSubselect(); }
