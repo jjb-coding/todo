@@ -139,11 +139,16 @@ body {
 .dag-statusbar .dag-modebtn,
 .dag-statusbar .dag-bankbtn,
 .dag-statusbar .dag-editorind,
-.dag-statusbar .dag-delbtn {
+.dag-statusbar .dag-delbtn,
+.dag-statusbar .dag-settingbtn {
   width: 30px; height: 28px; border-radius: 8px; cursor: pointer;
   border: 1px solid var(--node-border); background: var(--col-a); color: var(--node-title);
   font-weight: 700; font-size: 14px; font-family: inherit;
 }
+/* [1] on/off, and [2]'s 3 states (default/keep-in-view has no extra style). */
+.dag-statusbar .dag-settingbtn.on { background: #2563eb; border-color: #1d4fc4; color: #eef4ff; }
+.dag-statusbar .dag-settingbtn.follow-center { background: #0d9488; border-color: #0a756c; color: #eafffb; }
+.dag-statusbar .dag-settingbtn.follow-none { background: #eef1f5; color: #aab4c0; border-color: #dde3ea; }
 .dag-statusbar .dag-delbtn { width: auto; padding: 0 8px; font-size: 12px; }
 .dag-statusbar .dag-delbtn:disabled {
   cursor: not-allowed; color: #aab4c0; background: #eef1f5; border-color: #dde3ea;

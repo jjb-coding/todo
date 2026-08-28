@@ -3,8 +3,9 @@
 //  ephemeral UI state (selection, banks, the editor, focus, keyboard
 //  partitions). The DAG's actual data lives in state.ts (nodes/edges, and
 //  every mutation to them); ancestry/ranking queries live in queries.ts;
-//  the coordinate-assignment layout algorithm lives in layout.ts. This file
-//  is the only one that touches the DOM.
+//  the coordinate-assignment layout algorithm lives in layout.ts; user
+//  preferences live in settings.ts. This file is the only one that touches
+//  the DOM.
 //  - Focus: an "excluded" node-id mask lets the view narrow to a subgraph
 //    without ever duplicating the graph itself — every layout pass filters
 //    the current node/edge lists by this mask at the moment it runs, then
@@ -22,6 +23,8 @@ import {
   COL_W, H_PAD, NODE_W, MARGIN, LABEL_BAND,
 } from "./layout";
 import type { NodeSize } from "./layout";
+import { getSettings, setSettingValue } from "./settings";
+import type { FollowMode } from "./settings";
 
 interface LaidNode {
   def: NodeDef;
@@ -524,17 +527,23 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // clicking instead of select-then-press), so nothing needs clearing here.
   function cycleSelMode(): void {
     const next = selMode === "union" ? "intersection" : selMode === "intersection" ? "edit" : "union";
-    // S can't be disabled while it's a live edit-mode target — remember
-    // whatever it was set to, force it enabled for the duration (still via
-    // toggleDisableS here, before selMode flips, so its own edit-mode guard
-    // doesn't block it), and put it back exactly as found on the way out.
+    // None of A/S/D can stay disabled while they're live edit-mode targets —
+    // remember whatever each was set to, force it enabled for the duration
+    // (still via its own toggleDisableX here, before selMode flips, so that
+    // function's edit-mode guard doesn't block it), and put it back exactly
+    // as found on the way out.
     if (next === "edit" && selMode !== "edit") {
+      bankADisabledBeforeEdit = bankADisabled;
+      bankDDisabledBeforeEdit = bankDDisabled;
       bankSDisabledBeforeEdit = bankSDisabled;
+      if (bankADisabled) toggleDisableA();
+      if (bankDDisabled) toggleDisableD();
       if (bankSDisabled) toggleDisableS();
-    } else if (selMode === "edit" && next !== "edit" && bankSDisabledBeforeEdit) {
-      stripBankHover(bankS);   // re-disabling always empties S, same as toggleDisableS
-      bankSDisabled = true;
-      bankS = null;
+    } else if (selMode === "edit" && next !== "edit") {
+      // Re-disabling always empties the bank, same as toggleDisableX.
+      if (bankADisabledBeforeEdit) { stripBankHover(bankA); bankADisabled = true; bankA = null; }
+      if (bankDDisabledBeforeEdit) { stripBankHover(bankD); bankDDisabled = true; bankD = null; }
+      if (bankSDisabledBeforeEdit) { stripBankHover(bankS); bankSDisabled = true; bankS = null; }
       paintBankBadges();
     }
     selMode = next;
@@ -558,10 +567,29 @@ function render(container: HTMLElement, initial: GraphDef): void {
   let bankS: Set<string> | null = null;
   // Right-click on S deactivates it: emptied, and the Ctrl+A/Ctrl+D wiring
   // actions fall back to using the current selection directly instead of S.
-  let bankSDisabled = false;
-  // Remembers bankSDisabled across a trip through Edit mode (where it's
-  // always forced off) — see cycleSelMode.
+  // Starting state comes from settings.ts (bank{A,S,D}DisabledByDefault).
+  let bankSDisabled = getSettings().bankSDisabledByDefault.value;
+  // Right-click on A/D deactivates them the same way — emptied, no
+  // Prospective Mode, bare A/D presses do nothing. Unlike S, though, A/D
+  // still have a job while disabled: attaching to a new node being created
+  // (see boundA/boundD below).
+  let bankADisabled = getSettings().bankADisabledByDefault.value;
+  let bankDDisabled = getSettings().bankDDisabledByDefault.value;
+  // Remembers bankXDisabled across a trip through Edit mode (where all three
+  // are always forced off) — see cycleSelMode.
   let bankSDisabledBeforeEdit = false;
+  let bankADisabledBeforeEdit = false;
+  let bankDDisabledBeforeEdit = false;
+  // While A/D are disabled, Ctrl+A/Ctrl+D in the editor still needs
+  // somewhere to remember "attach these as parents/children of the new
+  // node" — bankA/bankD stay empty (disabled means no real bank), so this
+  // is where that pending selection lives instead. Set by an explicit
+  // overwrite (see handlePaneKeydown), not by toggling membership one node
+  // at a time like a real bank — and still checked by wouldCreateCycle,
+  // exactly as bankA/bankD would be, so e.g. Ctrl+D can't bind something
+  // that would cycle against whatever Ctrl+A bound.
+  let boundA: Set<string> | null = null;
+  let boundD: Set<string> | null = null;
   // Pressing a bank key with nothing selected arms it, waiting for a selection
   // to bank (and deselect) on the next press — instead of banking immediately.
   let prospective: BankLetter | null = null;
@@ -580,8 +608,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // a cycle, and is blocked here instead. S is subject to both halves of the
   // check, since it plays the "future node" role for both A and D at once.
   function wouldCreateCycle(letter: BankLetter, sel: string[]): boolean {
-    const dIsAncestor = !!bankD && sel.some(s => Array.from(bankD!).some(d => ancOf.get(s)!.has(d)));
-    const aIsDescendant = !!bankA && sel.some(s => Array.from(bankA!).some(a => descOf.get(s)!.has(a)));
+    // Disabled A/D still have to be checked against — see boundA/boundD.
+    const dSet = bankDDisabled ? boundD : bankD;
+    const aSet = bankADisabled ? boundA : bankA;
+    const dIsAncestor = !!dSet && sel.some(s => Array.from(dSet).some(d => ancOf.get(s)!.has(d)));
+    const aIsDescendant = !!aSet && sel.some(s => Array.from(aSet).some(a => descOf.get(s)!.has(a)));
     if (letter === "A") return dIsAncestor;
     if (letter === "D") return aIsDescendant;
     return dIsAncestor || aIsDescendant;
@@ -613,22 +644,24 @@ function render(container: HTMLElement, initial: GraphDef): void {
     bank?.forEach(id => nodes.get(id)?.el.classList.remove("bank-hover"));
   };
   // Clearing A/D also switches off the editor's matching toggle, if it was
-  // on. refresh() (not just paintBankBadges/updateBar) matters here because
+  // on, and drops any pending disabled-mode attach set (boundA/boundD) —
+  // refresh() (not just paintBankBadges/updateBar) matters here because
   // edit mode's node rings are painted directly from bank contents.
   function clearBankA(): void {
     stripBankHover(bankA);
-    bankA = null;
-    if (editorUseA) { editorUseA = false; updateEditorFlags(); }
+    bankA = null; boundA = null;
+    editorUseA = false; updateEditorFlags();
     paintBankBadges(); refresh();
   }
   function clearBankD(): void {
     stripBankHover(bankD);
-    bankD = null;
-    if (editorUseD) { editorUseD = false; updateEditorFlags(); }
+    bankD = null; boundD = null;
+    editorUseD = false; updateEditorFlags();
     paintBankBadges(); refresh();
   }
   function clearBankS(): void { stripBankHover(bankS); bankS = null; paintBankBadges(); refresh(); }
-  // Right-click: toggle S disabled/enabled, always emptying it in the process.
+  // Right-click: toggle disabled/enabled, always emptying the bank (and any
+  // pending disabled-mode attach set) in the process.
   function toggleDisableS(): void {
     if (selMode === "edit") return;   // S can't be disabled while it's a live edit-mode target
     stripBankHover(bankS);
@@ -636,29 +669,55 @@ function render(container: HTMLElement, initial: GraphDef): void {
     bankS = null;
     paintBankBadges(); refresh();
   }
+  function toggleDisableA(): void {
+    if (selMode === "edit") return;   // A can't be disabled while it's a live edit-mode target
+    stripBankHover(bankA);
+    bankADisabled = !bankADisabled;
+    bankA = null; boundA = null;
+    editorUseA = false; updateEditorFlags();
+    paintBankBadges(); refresh();
+  }
+  function toggleDisableD(): void {
+    if (selMode === "edit") return;   // D can't be disabled while it's a live edit-mode target
+    stripBankHover(bankD);
+    bankDDisabled = !bankDDisabled;
+    bankD = null; boundD = null;
+    editorUseD = false; updateEditorFlags();
+    paintBankBadges(); refresh();
+  }
   // The set wireBankToS should treat as "S" — the real bank, unless it's been
   // disabled, in which case the current selection stands in for it directly
   // (and is never itself recorded into the bank).
   const effectiveS = (): Set<string> | null =>
     bankSDisabled ? (selectedIds.length ? new Set(selectedIds) : null) : bankS;
+  // What the editor should actually attach as parents/children when the new
+  // node is added: the real toggle when enabled, or whatever's pending in
+  // boundA/boundD when disabled — see handlePaneKeydown.
+  const attachA = (): boolean => bankADisabled ? !!boundA : editorUseA;
+  const attachD = (): boolean => bankDDisabled ? !!boundD : editorUseD;
   // Giving each focus level its own banks would be a coordination nightmare
   // (a node banked here, then edited on a deeper level such that it becomes
   // kin of other bank members up here...) — simplest and safest is to just
   // empty everything whenever focus is pushed or popped.
   function clearAllBanks(): void {
     bankA = null; bankD = null; bankS = null;
-    bankSDisabled = false;
+    boundA = null; boundD = null;
+    bankADisabled = false; bankDDisabled = false; bankSDisabled = false;
     prospective = null;
     editorUseA = false; editorUseD = false; updateEditorFlags();
     paintBankBadges(); updateBar();
   }
   // A node can belong to at most one bank; right-click removes it from
-  // whichever it's currently in (a no-op if it's in none).
+  // whichever it's currently in (a no-op if it's in none). Also prunes it
+  // from boundA/boundD, since a deleted node can't stay pending-bound to a
+  // new one that hasn't been created yet.
   function removeFromBanks(id: string): boolean {
     let changed = false;
     if (bankA?.delete(id)) { changed = true; if (!bankA.size) bankA = null; }
     if (bankD?.delete(id)) { changed = true; if (!bankD.size) bankD = null; }
     if (bankS?.delete(id)) { changed = true; if (!bankS.size) bankS = null; }
+    if (boundA?.delete(id) && !boundA.size) boundA = null;
+    if (boundD?.delete(id) && !boundD.size) boundD = null;
     return changed;
   }
 
@@ -691,10 +750,12 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // While any bank is prospective, no bank key does anything further — Enter
   // commits it (see the keydown handler) and Esc cancels it, regardless of
   // which bank is armed.
+  const bankDisabled = (letter: BankLetter): boolean =>
+    letter === "A" ? bankADisabled : letter === "D" ? bankDDisabled : bankSDisabled;
   function pressBank(letter: BankLetter): void {
     if (selMode === "edit") return;   // edit mode banks via direct clicks, never prospective
     if (prospective !== null) return;
-    if (letter === "S" && bankSDisabled) return;
+    if (bankDisabled(letter)) return; // no Prospective Mode for a disabled bank
     if (!selectedIds.length) { prospective = letter; updateBar(); updateCursors(); return; }
     setBank(letter, selectedIds);
   }
@@ -723,7 +784,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // matching attach flag — the keyboard-driven commit path only.
   function toggleBankMembership(letter: BankLetter, sel: string[]): void {
     if (selMode === "edit" || prospective !== null || !sel.length) return;
-    if (letter === "S" && bankSDisabled) return;
+    if (bankDisabled(letter)) return;
     if (toggleBankMembershipRaw(letter, sel)) {
       if (letter === "A") { editorUseA = !editorUseA; updateEditorFlags(); }
       else if (letter === "D") { editorUseD = !editorUseD; updateEditorFlags(); }
@@ -875,13 +936,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
   focusInd.appendChild(focusDepthEl);
   const aBtn = document.createElement("button");
   aBtn.className = "dag-bankbtn a"; aBtn.type = "button"; aBtn.textContent = "A";
-  aBtn.title = "Bank A — A banks/arms, Shift+A toggles membership, Alt+A clears, Ctrl+A/Ctrl+Shift+A wire it onto S as parents, hold C then A to centre on it";
+  aBtn.title = "Bank A — A banks/arms, Shift+A toggles membership, Alt+A clears, Ctrl+A/Ctrl+Shift+A wire it onto S as parents, right-click disables (Ctrl+A in the editor then binds the selection directly, without banking it), hold C then A to centre on it";
   const sBtn = document.createElement("button");
   sBtn.className = "dag-bankbtn s"; sBtn.type = "button"; sBtn.textContent = "S";
   sBtn.title = "Bank S — S banks/arms, Shift+S toggles membership, Alt+S clears, right-click disables (S's wiring actions then use the selection directly), hold C then S to centre on it";
   const dBtn = document.createElement("button");
   dBtn.className = "dag-bankbtn d"; dBtn.type = "button"; dBtn.textContent = "D";
-  dBtn.title = "Bank D — D banks/arms, Shift+D toggles membership, Alt+D clears, Ctrl+D/Ctrl+Shift+D wire it onto S as children, hold C then D to centre on it";
+  dBtn.title = "Bank D — D banks/arms, Shift+D toggles membership, Alt+D clears, Ctrl+D/Ctrl+Shift+D wire it onto S as children, right-click disables (Ctrl+D in the editor then binds the selection directly, without banking it), hold C then D to centre on it";
   const editorInd = document.createElement("button");
   editorInd.className = "dag-editorind open"; editorInd.type = "button"; editorInd.textContent = "I";
   editorInd.title = "Node editor (below) — W or click starts a new node; select one node to edit it";
@@ -901,18 +962,62 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const groupBanks = document.createElement("div");
   groupBanks.className = "dag-bargroup";
   groupBanks.append(aBtn, sBtn, dBtn);
+  groupBanks.style.display = getSettings().banksHiddenByDefault.value ? "none" : "";
   const groupEditing = document.createElement("div");
   groupEditing.className = "dag-bargroup";
   groupEditing.append(editorInd, delBtn);
-  bar.append(groupState, groupMode, groupBanks, groupEditing);
+
+  // Settings framework: icons for [1]/[2] only (the rest aren't the sort of
+  // thing a live icon toggle would make sense for — see settings.ts). A
+  // settings modal to bring other settings into the bar, or take these back
+  // out, comes later; showOnBar just decides whether the icon exists at all.
+  const setting1Btn = document.createElement("button");
+  setting1Btn.className = "dag-settingbtn"; setting1Btn.type = "button"; setting1Btn.textContent = "1";
+  const setting2Btn = document.createElement("button");
+  setting2Btn.className = "dag-settingbtn"; setting2Btn.type = "button"; setting2Btn.textContent = "2";
+  const groupSettings = document.createElement("div");
+  groupSettings.className = "dag-bargroup";
+  groupSettings.append(setting1Btn, setting2Btn);
+
+  bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
   modeBtn.addEventListener("click", () => cycleSelMode());
   aBtn.addEventListener("click", () => clearBankA());
   sBtn.addEventListener("click", () => clearBankS());
   dBtn.addEventListener("click", () => clearBankD());
+  aBtn.addEventListener("contextmenu", ev => { ev.preventDefault(); toggleDisableA(); });
   sBtn.addEventListener("contextmenu", ev => { ev.preventDefault(); toggleDisableS(); });
+  dBtn.addEventListener("contextmenu", ev => { ev.preventDefault(); toggleDisableD(); });
   editorInd.addEventListener("click", () => startNewNode());
   delBtn.addEventListener("click", () => deleteNodes(selectedIds));
+
+  // [1] selectAndCenterOnCreate: plain boolean toggle.
+  function updateSetting1Btn(): void {
+    const s = getSettings().selectAndCenterOnCreate;
+    setting1Btn.style.display = s.showOnBar ? "" : "none";
+    setting1Btn.classList.toggle("on", s.value);
+    setting1Btn.title = `Setting — select & centre on a new node when it's created: currently ${s.value ? "on" : "off"} (click to toggle)`;
+  }
+  setting1Btn.addEventListener("click", () => {
+    setSettingValue("selectAndCenterOnCreate", !getSettings().selectAndCenterOnCreate.value);
+    updateSetting1Btn();
+  });
+  // [2] followSelection: 3-state cycle, keep-in-view -> center -> none.
+  function updateSetting2Btn(): void {
+    const s = getSettings().followSelection;
+    setting2Btn.style.display = s.showOnBar ? "" : "none";
+    setting2Btn.classList.toggle("follow-center", s.value === "center");
+    setting2Btn.classList.toggle("follow-none", s.value === "none");
+    setting2Btn.title = `Setting — Left/Right follow mode: currently "${s.value}" (click to cycle keep-in-view / center / none)`;
+  }
+  setting2Btn.addEventListener("click", () => {
+    const cur = getSettings().followSelection.value;
+    const next: FollowMode = cur === "keep-in-view" ? "center" : cur === "center" ? "none" : "keep-in-view";
+    setSettingValue("followSelection", next);
+    updateSetting2Btn();
+  });
+  updateSetting1Btn();
+  updateSetting2Btn();
 
   // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
   // distinct from the coloured-drop-shadow/dotted-outline selection scheme.
@@ -978,7 +1083,9 @@ function render(container: HTMLElement, initial: GraphDef): void {
     paintBank(aBtn, "A", !!bankA);
     paintBank(dBtn, "D", !!bankD);
     paintBank(sBtn, "S", !!bankS);
+    aBtn.classList.toggle("disabled", bankADisabled);
     sBtn.classList.toggle("disabled", bankSDisabled);
+    dBtn.classList.toggle("disabled", bankDDisabled);
 
     const aState = bankA ? bankActionState("A") : null;
     const dState = bankD ? bankActionState("D") : null;
@@ -1135,7 +1242,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
     return [];
   };
   // Scroll the (single) current column into view with the fewest whole-column shifts.
+  // [2] followSelection: "keep-in-view" (default) only nudges the scroll
+  // enough to bring the column on screen; "center" always centres it
+  // instead; "none" never auto-scrolls for it at all.
   const reveal = (): void => {
+    const mode = getSettings().followSelection.value;
+    if (mode === "none") return;
+    if (mode === "center") { centerOnSelection(); return; }
     const cols = currentCols();
     if (cols.length !== 1) return;
     const c = cols[0], vc = viewportCols();
@@ -1310,8 +1423,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
   editorCancelBtn.addEventListener("click", () => { if (lastEditorMode === "existing") deleteEditorTarget(); else clearEditorDraft(); });
 
   function updateEditorFlags(): void {
-    flagA.classList.toggle("on", editorUseA);
-    flagD.classList.toggle("on", editorUseD);
+    flagA.classList.toggle("on", attachA());
+    flagD.classList.toggle("on", attachD());
   }
   // Paint the chrome (background/icon/hint/buttons/disabled-ness) for
   // whichever mode is currently showing — cheap, so it's fine to call on
@@ -1409,7 +1522,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function commitNew(): void {
     const title = editorTitle.value.trim();
     if (!title) { editorTitle.focus(); return; }   // a node needs a label
-    const body = editorBody.value.trim(), useA = editorUseA, useD = editorUseD;
+    const body = editorBody.value.trim(), useA = attachA(), useD = attachD();
     addNode(title, body, useA, useD);
     editingNew = false;
     editorUseA = false; editorUseD = false; updateEditorFlags();
@@ -1437,18 +1550,34 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // field actually has focus) and the global keydown handler (used when the
   // pane is merely the *active partition*, reached via Shift+Tab, with
   // nothing inside it focused — see "Keyboard focus partitions").
+  // Ctrl+A/Ctrl+D in the editor, while that bank is disabled: overwrite
+  // boundA/boundD outright with whatever's currently selected — never a
+  // toggle, and an empty selection means "nothing" (clears it) rather than
+  // arming Prospective Mode. Still subject to the same cross-bank/cycle
+  // checks a real bank commit would use; a rejected overwrite just leaves
+  // the previous binding as it was.
+  function overwriteBound(letter: "A" | "D"): void {
+    if (!selectedIds.length) {
+      if (letter === "A") boundA = null; else boundD = null;
+    } else if (!otherBanksConflict(letter, selectedIds) && !wouldCreateCycle(letter, selectedIds)) {
+      if (letter === "A") boundA = new Set(selectedIds); else boundD = new Set(selectedIds);
+    }
+    updateEditorFlags();
+  }
   function handlePaneKeydown(e: KeyboardEvent): void {
     const k = e.key;
     if (e.ctrlKey && (k === "a" || k === "A")) {
       e.preventDefault();
+      if (bankADisabled) overwriteBound("A");
       // An empty bank can't be toggled on — instead, act as if A were pressed
       // with the DAG in focus (banks the current selection, and toggles this
       // same flag as a side effect of setBank).
-      if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
+      else if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
       else pressBank("A");
     } else if (e.ctrlKey && (k === "d" || k === "D")) {
       e.preventDefault();
-      if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
+      if (bankDDisabled) overwriteBound("D");
+      else if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
       else pressBank("D");
     } else if (e.ctrlKey && k === "Enter") {
       e.preventDefault();
@@ -1488,19 +1617,27 @@ function render(container: HTMLElement, initial: GraphDef): void {
 
   // Add a new node to the (single, never-duplicated) graph, wire it to
   // whatever's currently in banks A/D per the two flags, and bring the
-  // persistent DOM up to date. Never touches selection or scroll position —
-  // adding a node can only ever need as many or more ranks, never fewer.
+  // persistent DOM up to date. By default never touches selection or scroll
+  // position — adding a node can only ever need as many or more ranks,
+  // never fewer — but [1] selectAndCenterOnCreate opts into selecting and
+  // centring on it instead.
   function addNode(title: string, body: string, useA: boolean, useD: boolean): void {
     const id = "N" + nextNodeSeq++;
     const def: NodeDef = { id, title, body: body || undefined };
     graphAddNode(def);
-    if (useA && bankA) bankA.forEach(a => addEdge(a, id));
-    if (useD && bankD) bankD.forEach(d => addEdge(id, d));
+    // Disabled A/D attach from boundA/boundD instead of the (always-empty,
+    // while disabled) bank itself.
+    if (useA) (bankADisabled ? boundA : bankA)?.forEach(a => addEdge(a, id));
+    if (useD) (bankDDisabled ? boundD : bankD)?.forEach(d => addEdge(id, d));
+    boundA = null; boundD = null;
 
     addNodeCard(def);
     syncGraphStructure();
     paintBankBadges();
+    const selectOnCreate = getSettings().selectAndCenterOnCreate.value;
+    if (selectOnCreate) { selectedIds = [id]; mode = "nodes"; subBuffer = ""; }
     refresh();
+    if (selectOnCreate) centerOnSelection();
   }
 
   // Ctrl+A / Ctrl+D with the DAG in focus: wire bank A on as parents of bank S
@@ -1549,7 +1686,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // Shift toggles membership instead, same as toggleBankMembership. Either
   // way, immediately re-applies any newly-possible A->S / S->D wiring.
   function editBankClick(letter: BankLetter, id: string, shift: boolean): void {
-    if (letter === "S" && bankSDisabled) return;
+    if (bankDisabled(letter)) return;   // A/S/D are always force-enabled during edit mode; defensive
     if (shift) {
       toggleBankMembershipRaw(letter, [id]);
     } else {
