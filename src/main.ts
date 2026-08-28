@@ -734,6 +734,16 @@ function render(container: HTMLElement, initial: GraphDef): void {
     paintBankBadges(); refresh();
   }
   function clearBankS(): void { stripBankHover(bankS); bankS = null; paintBankBadges(); refresh(); }
+  // Q with the DAG in focus: empty every filled bank (A, S and D) in one go.
+  // Only the real (enabled) banks — a disabled bank's transient editor capture
+  // is left alone, and disabled banks are empty anyway.
+  function emptyAllBanks(): void {
+    if (!bankA && !bankS && !bankD) return;
+    stripBankHover(bankA); stripBankHover(bankS); stripBankHover(bankD);
+    bankA = null; bankD = null; bankS = null;
+    editorUseA = false; editorUseD = false; updateEditorFlags();
+    paintBankBadges(); refresh();
+  }
   // Right-click: toggle disabled/enabled, always emptying the bank (and any
   // pending disabled-mode attach set) in the process.
   function toggleDisableS(): void {
@@ -1517,9 +1527,33 @@ function render(container: HTMLElement, initial: GraphDef): void {
   editorAddBtn.addEventListener("click", () => { if (lastEditorMode === "existing") commitExisting(); else commitNew(); });
   editorCancelBtn.addEventListener("click", () => { if (lastEditorMode === "existing") deleteEditorTarget(); else clearEditorDraft(); });
 
+  const setEqArr = (s: Set<string>, arr: string[]): boolean =>
+    s.size === arr.length && arr.every(x => s.has(x));
+
+  // The New Node editor's A/D connection flag has three lit variants:
+  //   "real"      — attaching a populated, enabled bank A/D (solid bar)
+  //   "transient" — a capture scoped to this dialog only (bank A/D disabled)
+  //                 that still matches the current selection (dashed bar)
+  //   "stale"     — a transient capture whose nodes no longer match the
+  //                 selection (dashed amber bar)
+  function connFlagState(letter: "A" | "D"): "off" | "real" | "transient" | "stale" {
+    if (letter === "A" ? bankADisabled : bankDDisabled) {
+      const bound = letter === "A" ? boundA : boundD;
+      if (!bound || !bound.size) return "off";
+      if (selectedIds.length && !setEqArr(bound, selectedIds)) return "stale";
+      return "transient";
+    }
+    const use = letter === "A" ? editorUseA : editorUseD;
+    const bank = letter === "A" ? bankA : bankD;
+    return use && bank && bank.size ? "real" : "off";
+  }
   function updateEditorFlags(): void {
-    flagA.classList.toggle("on", attachA());
-    flagD.classList.toggle("on", attachD());
+    ([[flagA, "A"], [flagD, "D"]] as [HTMLDivElement, "A" | "D"][]).forEach(([flag, letter]) => {
+      const st = connFlagState(letter);
+      flag.classList.toggle("on", st !== "off");
+      flag.classList.toggle("transient", st === "transient");
+      flag.classList.toggle("stale", st === "stale");
+    });
   }
   // Paint the chrome (background/icon/hint/buttons/disabled-ness) for
   // whichever mode is currently showing — cheap, so it's fine to call on
@@ -1550,7 +1584,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       editorCancelBtn.disabled = mode === "disabled";
       editorHint.textContent = mode === "disabled"
         ? "W starts a new node · select a single node to edit it"
-        : "Tab to switch fields · Ctrl+A/Ctrl+D toggle banks as ancestors/descendants · Ctrl+Enter adds · Esc clears";
+        : "Tab switches fields · Ctrl+A/Ctrl+D bind the selection as ancestors/descendants · Ctrl+Shift+A/D (or Ctrl+Q) unbind · Ctrl+Enter adds · Esc clears";
     }
   }
   // Recomputes which node (if any) the editor should be showing, and
@@ -1568,16 +1602,18 @@ function render(container: HTMLElement, initial: GraphDef): void {
         editorTitle.value = editorOrigTitle; editorBody.value = editorOrigBody;
       } else {
         editorTitle.value = ""; editorBody.value = "";
-        if (mode === "disabled") { editorUseA = false; editorUseD = false; updateEditorFlags(); }
+        if (mode === "disabled") { editorUseA = false; editorUseD = false; }
       }
     }
     paintEditorChrome(mode);
+    updateEditorFlags();   // keep the flags (incl. the "stale" cue) tracking the live selection
   }
   // W (or the "I" status-bar icon): explicitly start a fresh new-node draft,
   // locking the editor into "new" no matter what gets selected afterwards.
   function startNewNode(): void {
     if (!editingNew) {
       editingNew = true;
+      boundA = null; boundD = null;                 // transient captures are scoped to one dialog
       editorUseA = !!bankA; editorUseD = !!bankD;   // default on if there's something to attach
       updateEditorFlags();
       lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
@@ -1588,6 +1624,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function clearEditorDraft(): void {
     editorTitle.value = ""; editorBody.value = "";
     editingNew = false;
+    boundA = null; boundD = null;                   // discard the dialog's transient captures
     editorUseA = false; editorUseD = false; updateEditorFlags();
     lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync even if mode/target don't change
     syncEditor();
@@ -1659,20 +1696,61 @@ function render(container: HTMLElement, initial: GraphDef): void {
     }
     updateEditorFlags();
   }
+  // Ctrl+Shift+A/D (and Ctrl+Q for both): drop the editor's A/D connection,
+  // whichever kind it is — turn off a real bank attach, or discard a transient
+  // capture. The real bank itself is left intact.
+  function paneClearConn(letter: "A" | "D"): void {
+    if (letter === "A") {
+      if (bankADisabled) boundA = null; else editorUseA = false;
+    } else {
+      if (bankDDisabled) boundD = null; else editorUseD = false;
+    }
+    paintBankBadges(); updateBar(); updateEditorFlags();
+  }
+  // Ctrl+A/D in the editor: capture the current selection as the new node's
+  // ancestor/descendant connection. An enabled bank is filled with it outright
+  // (replacing whatever it held) and the attach flag set; a disabled bank
+  // feeds only the transient, dialog-scoped capture. Re-pressing while the
+  // selection still matches the capture clears it (the press would otherwise
+  // be a no-op). All under the usual cross-bank / cycle guards.
+  function paneCaptureConn(letter: "A" | "D"): void {
+    const disabled = letter === "A" ? bankADisabled : bankDDisabled;
+    const captured = disabled ? (letter === "A" ? boundA : boundD)
+                              : (letter === "A" ? bankA : bankD);
+    const on = letter === "A" ? editorUseA : editorUseD;
+    if (captured && captured.size && selectedIds.length &&
+        setEqArr(captured, selectedIds) && (disabled || on)) {
+      paneClearConn(letter);
+      return;
+    }
+    if (disabled) {
+      overwriteBound(letter);                       // replace boundX (or clear it, if nothing's selected)
+    } else if (!selectedIds.length) {
+      if (captured && captured.size) {              // nothing to capture — just toggle the attach
+        if (letter === "A") editorUseA = !editorUseA; else editorUseD = !editorUseD;
+      }
+    } else if (setBankRaw(letter, selectedIds)) {   // fill the real bank + bind
+      if (letter === "A") editorUseA = true; else editorUseD = true;
+    }
+    paintBankBadges(); updateBar(); updateEditorFlags();
+  }
+  // The New Node editor's connection shortcuts — Ctrl+A/D bind the selection,
+  // Ctrl+Shift+A/D unbind one, Ctrl+Q unbinds both. Shared so they fire whether
+  // the keyboard is on the pane (field focused, or Shift+Tab'd there) or still
+  // on the DAG view where the nodes are actually being picked. Returns whether
+  // it consumed the event.
+  function handleEditorConnKey(e: KeyboardEvent): boolean {
+    if (!editingNew || !e.ctrlKey) return false;
+    const kl = e.key.toLowerCase();
+    if (kl === "q") { paneClearConn("A"); paneClearConn("D"); return true; }
+    if (kl === "a") { e.shiftKey ? paneClearConn("A") : paneCaptureConn("A"); return true; }
+    if (kl === "d") { e.shiftKey ? paneClearConn("D") : paneCaptureConn("D"); return true; }
+    return false;
+  }
   function handlePaneKeydown(e: KeyboardEvent): void {
     const k = e.key;
-    if (e.ctrlKey && (k === "a" || k === "A")) {
-      e.preventDefault();
-      if (bankADisabled) overwriteBound("A");
-      else if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
-      // Empty, enabled bank: there's nothing to attach and nothing to toggle,
-      // so Ctrl+A does nothing here — it must not quietly bank the selection.
-    } else if (e.ctrlKey && (k === "d" || k === "D")) {
-      e.preventDefault();
-      if (bankDDisabled) overwriteBound("D");
-      else if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
-      // Empty, enabled bank: Ctrl+D does nothing (see Ctrl+A above).
-    } else if (e.ctrlKey && k === "Enter") {
+    if (handleEditorConnKey(e)) { e.preventDefault(); return; }
+    if (e.ctrlKey && k === "Enter") {
       e.preventDefault();
       if (lastEditorMode === "existing") commitExisting(); else commitNew();
     } else if (k === "Escape") {
@@ -1919,8 +1997,14 @@ function render(container: HTMLElement, initial: GraphDef): void {
   };
 
   function boxAddToSelection(hits: string[]): void {
+    // A single sweep can enclose a node and its own descendant at once — a
+    // pair the click-by-click flow (green/red barrier) would never allow.
+    // Keep only the lowest of each lineage: drop any hit that is an ancestor
+    // of another hit. (Cross-lineage incongruence with the *existing*
+    // selection is already handled by blockedSet, below.)
+    const congruent = hits.filter(id => !hits.some(o => o !== id && ancOf.get(o)!.has(id)));
     let changed = false;
-    hits.forEach(id => {
+    congruent.forEach(id => {
       if (selectedIds.includes(id) || blockedSet.has(id) || prospectiveBlocked(id)) return;
       selectedIds = [...selectedIds, id]; changed = true;
     });
@@ -2125,6 +2209,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     // Everything from here on is the DAG view's own keybinds, live only
     // while it's the active partition.
 
+    // While the New Node editor is open, its Ctrl+A/D connection shortcuts
+    // work from here too — that's where the nodes to bind get selected.
+    if (handleEditorConnKey(e)) { e.preventDefault(); return; }
+
     // A prospective bank takes over Esc/Enter before anything else does.
     if (prospective !== null && k === "Escape") { e.preventDefault(); prospective = null; updateBar(); updateCursors(); return; }
     if (prospective !== null && k === "Enter")  { e.preventDefault(); commitProspective(); return; }
@@ -2184,6 +2272,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       return;
     }
     if ((k === "w" || k === "W") && !e.ctrlKey && !e.altKey) { e.preventDefault(); startNewNode(); return; }
+    if ((k === "q" || k === "Q") && !e.ctrlKey && !e.altKey && !e.shiftKey) { e.preventDefault(); emptyAllBanks(); return; }
 
     if (k === "Delete" && selectedIds.length) { e.preventDefault(); deleteNodes(selectedIds); return; }
 

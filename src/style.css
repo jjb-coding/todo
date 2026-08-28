@@ -335,6 +335,21 @@ body {
 .dag-nodebox-flag.d { right: -8px; }
 .dag-nodebox-flag.d::before { left: 0; background: rgb(224, 49, 49); }
 .dag-nodebox-flag.d::after { left: 4px; background: rgb(224, 49, 49); }
+/* "transient": a capture scoped to the New Node dialog (bank A/D disabled) —
+   dashed rather than the solid bar of a real bank attach. */
+.dag-nodebox-flag.a.transient::before, .dag-nodebox-flag.a.transient::after {
+  background: repeating-linear-gradient(to bottom, rgb(47, 158, 68) 0 3px, transparent 3px 6px);
+}
+.dag-nodebox-flag.d.transient::before, .dag-nodebox-flag.d.transient::after {
+  background: repeating-linear-gradient(to bottom, rgb(224, 49, 49) 0 3px, transparent 3px 6px);
+}
+/* "stale": a transient capture whose nodes no longer match the selection —
+   amber, tighter dashes, faint amber halo. */
+.dag-nodebox-flag.a.stale::before, .dag-nodebox-flag.a.stale::after,
+.dag-nodebox-flag.d.stale::before, .dag-nodebox-flag.d.stale::after {
+  background: repeating-linear-gradient(to bottom, #e0a800 0 2px, transparent 2px 5px);
+}
+.dag-nodebox-flag.stale { box-shadow: 0 0 0 1px rgba(224, 168, 0, 0.4); border-radius: 2px; }
 
 /* Shift-drag selection rectangle — a transient overlay, never affects layout. */
 .dag-boxsel {
