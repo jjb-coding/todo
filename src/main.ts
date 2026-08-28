@@ -1,25 +1,27 @@
 // ============================================================================
-//  DAG layout engine
-//  - Columns are indexed by rank, all equal width.
-//  - Each Column holds an ordered list of "places": a place is either a Node
-//    or a thin Gap. A multi-rank edge reserves one Gap per intermediate column
-//    so its connector has a clear horizontal channel to pass through.
-//  - Vertical positions come from an iterative coordinate-assignment pass
-//    (barycentre of neighbours + order-preserving minimum-separation
-//    projection). This straightens long edges and removes small lateral jogs.
-//  - Between columns the connector is a gentle Bezier; inside a column it runs
-//    straight through the gap channel.
-//  - Edge colours: <=4 hues, chosen to keep edges that share an endpoint
-//    distinct.
+//  Application shell — DOM creation, mouse/keyboard interaction, and all the
+//  ephemeral UI state (selection, banks, the editor, focus, keyboard
+//  partitions). The DAG's actual data lives in state.ts (nodes/edges, and
+//  every mutation to them); ancestry/ranking queries live in queries.ts;
+//  the coordinate-assignment layout algorithm lives in layout.ts. This file
+//  is the only one that touches the DOM.
 //  - Focus: an "excluded" node-id mask lets the view narrow to a subgraph
 //    without ever duplicating the graph itself — every layout pass filters
-//    `g` by the current mask at the moment it runs, then re-lays-out and
-//    repaints the same, persistent DOM elements.
+//    the current node/edge lists by this mask at the moment it runs, then
+//    re-lays-out and repaints the same, persistent DOM elements.
 // ============================================================================
 
-interface NodeDef { id: string; title: string; body?: string; }
-interface EdgeDef { from: string; to: string; }
-interface GraphDef { nodes: NodeDef[]; edges: EdgeDef[]; }
+import type { NodeDef, GraphDef } from "./state";
+import {
+  initGraph, getNodes, getEdges, hasEdge, addEdge, deleteEdge,
+  addNode as graphAddNode, updateNode, deleteNodes as graphDeleteNodes,
+} from "./state";
+import { computeRanks, computeRelations } from "./queries";
+import {
+  computeLayout, bezierPath, colX, edgeKey,
+  COL_W, H_PAD, NODE_W, MARGIN, LABEL_BAND,
+} from "./layout";
+import type { NodeSize } from "./layout";
 
 interface LaidNode {
   def: NodeDef;
@@ -31,31 +33,6 @@ interface LaidNode {
   x: number;        // absolute top-left
   y: number;
 }
-
-// A vertical slot in a column, resolved by the coordinate-assignment pass.
-interface Place {
-  kind: "node" | "gap";
-  rank: number;
-  half: number;     // half-extent incl. padding (drives min separation)
-  weight: number;   // how strongly it's pulled toward its desired centre
-  order: number;    // stacking order within the column
-  center: number;   // resolved absolute centre-y
-  desired: number;  // target centre-y for the current iteration
-  node?: LaidNode;
-  edgeKey?: string; // for gaps
-}
-
-// ---- Tunable geometry ------------------------------------------------------
-const COL_W    = 240;                  // every column is this wide
-const H_PAD    = 34;                   // node inset inside its column
-const NODE_W   = COL_W - 2 * H_PAD;    // -> inter-column channel is 2*H_PAD wide
-const NODE_PAD = 13;                   // vertical breathing room around a node
-const GAP_H    = 2;                    // a gap is essentially a single line...
-const GAP_PAD  = 6;                    // ...with a little clearance around it
-const MARGIN   = 44;
-const LABEL_BAND = 34;                 // space at the top for rank labels
-const BEZIER   = 0.3;                  // Bezier handle length as a fraction of dx
-const ITERS    = 16;                   // coordinate-assignment iterations
 
 const PALETTE = ["#2563eb", "#e07b1a", "#0d9488", "#7c3aed"]; // blue, orange, teal, violet (kept clear of the semantic red/green rings)
 
@@ -98,42 +75,6 @@ function tallySvg(n: number, color: string): string {
          `stroke-width="1.6" stroke-linecap="round">${marks.join("")}</svg>`;
 }
 
-// ---- Geometry helpers ------------------------------------------------------
-const colX       = (rank: number) => MARGIN + rank * COL_W;
-const nodeLeftX  = (rank: number) => colX(rank) + H_PAD;
-const nodeRightX = (rank: number) => colX(rank) + COL_W - H_PAD;
-const edgeKey    = (e: EdgeDef) => e.from + "->" + e.to;
-
-// ---- Ranking: longest-path layering over a topological order ---------------
-function computeRanks(g: GraphDef): Map<string, number> {
-  const adj = new Map<string, string[]>();
-  const indeg = new Map<string, number>();
-  g.nodes.forEach(n => { adj.set(n.id, []); indeg.set(n.id, 0); });
-  g.edges.forEach(e => {
-    adj.get(e.from)!.push(e.to);
-    indeg.set(e.to, (indeg.get(e.to) || 0) + 1);
-  });
-
-  const rank = new Map<string, number>();
-  g.nodes.forEach(n => rank.set(n.id, 0));
-  const remaining = new Map(indeg);
-  const queue: string[] = [];
-  remaining.forEach((d, id) => { if (d === 0) queue.push(id); });
-
-  let processed = 0;
-  while (queue.length) {
-    const u = queue.shift()!;
-    processed++;
-    for (const v of adj.get(u)!) {
-      rank.set(v, Math.max(rank.get(v)!, rank.get(u)! + 1));
-      remaining.set(v, remaining.get(v)! - 1);
-      if (remaining.get(v) === 0) queue.push(v);
-    }
-  }
-  if (processed !== g.nodes.length) throw new Error("Graph is not acyclic.");
-  return rank;
-}
-
 // ---- Node element (HTML so the browser sizes it from content) --------------
 function makeNodeEl(def: NodeDef): HTMLDivElement {
   const el = document.createElement("div");
@@ -151,46 +92,17 @@ function makeNodeEl(def: NodeDef): HTMLDivElement {
   return el;
 }
 
-// ---- Weighted isotonic regression (pool adjacent violators) ----------------
-// Returns a non-decreasing fit of t minimising sum w_i (u_i - t_i)^2.
-function isotonic(t: number[], w: number[]): number[] {
-  const val: number[] = [], wt: number[] = [], cnt: number[] = [];
-  for (let i = 0; i < t.length; i++) {
-    let v = t[i], ww = w[i], c = 1;
-    while (val.length && val[val.length - 1] > v) {
-      const pv = val.pop()!, pw = wt.pop()!, pc = cnt.pop()!;
-      v = (pv * pw + v * ww) / (pw + ww);
-      ww = pw + ww;
-      c = pc + c;
-    }
-    val.push(v); wt.push(ww); cnt.push(c);
-  }
-  const out: number[] = [];
-  for (let b = 0; b < val.length; b++) for (let k = 0; k < cnt[b]; k++) out.push(val[b]);
-  return out;
-}
-
-// Place an ordered column of `Place`s at their desired centres, respecting
-// order and minimum separation. Classic separation-constrained least squares.
-function projectColumn(col: Place[]): void {
-  const n = col.length;
-  if (n === 0) return;
-  const off: number[] = new Array(n).fill(0);   // minimal centre offsets
-  for (let i = 1; i < n; i++) off[i] = off[i - 1] + col[i - 1].half + col[i].half;
-  const t = col.map((p, i) => p.desired - off[i]);
-  const w = col.map(p => p.weight);
-  const u = isotonic(t, w);
-  for (let i = 0; i < n; i++) col[i].center = u[i] + off[i];
-}
-
 // ============================================================================
 //  Layout + render
 // ============================================================================
-function render(container: HTMLElement, g: GraphDef): void {
+function render(container: HTMLElement, initial: GraphDef): void {
+  initGraph(initial);
+
   // ---- Focus mask -----------------------------------------------------------
-  // `excluded` names the node ids currently hidden from view. The graph object
-  // `g` is never copied or mutated — every layout pass filters it by this mask
-  // at the moment it runs, so toggling focus just means recomputing a layout.
+  // `excluded` names the node ids currently hidden from view. The graph data
+  // itself is never copied or mutated by this — every layout pass filters
+  // the current node/edge lists by this mask at the moment it runs, so
+  // toggling focus just means recomputing a layout.
   let excluded = new Set<string>();
   const included = (id: string) => !excluded.has(id);
 
@@ -222,8 +134,8 @@ function render(container: HTMLElement, g: GraphDef): void {
   // A focused subgraph can only ever need fewer; adding a node can only ever
   // need more — growRankPools() (below, near the scrollbar) extends the pool
   // when that happens, reusing addRankSlot(). -----------------------------
-  const fullRankMap0 = computeRanks(g);
-  let maxRank0 = Math.max(...g.nodes.map(n => fullRankMap0.get(n.id)!));
+  const fullRankMap0 = computeRanks({ nodes: getNodes().slice(), edges: getEdges().slice() });
+  let maxRank0 = Math.max(...getNodes().map(n => fullRankMap0.get(n.id)!));
 
   const colRects: { el: SVGElement; rank: number; parity: number }[] = [];
   const rankLabels: HTMLDivElement[] = [];
@@ -258,7 +170,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   function rebuildEdgeRecs(): void {
     edgeRecs.forEach(r => r.el.remove());
     edgeRecs.length = 0;
-    const E = g.edges;
+    const E = getEdges();
     const conflict: number[][] = E.map(() => []);
     for (let i = 0; i < E.length; i++)
       for (let j = i + 1; j < E.length; j++)
@@ -338,32 +250,17 @@ function render(container: HTMLElement, g: GraphDef): void {
     wireNode(ln);
     return ln;
   }
-  g.nodes.forEach(def => addNodeCard(def));
+  getNodes().forEach(def => addNodeCard(def));
 
   // --- Graph relations — recomputed whenever the graph is mutated (addNode) --
-  const children = new Map<string, string[]>();
-  const parents = new Map<string, string[]>();
-  const ancOf = new Map<string, Set<string>>();
-  const descOf = new Map<string, Set<string>>();
-
-  // Everything reachable from `start` along `adj` (start excluded).
-  const reach = (start: string, adj: Map<string, string[]>): Set<string> => {
-    const seen = new Set<string>();
-    const stack = [...(adj.get(start) || [])];
-    while (stack.length) {
-      const x = stack.pop()!;
-      if (seen.has(x)) continue;
-      seen.add(x);
-      for (const y of adj.get(x) || []) stack.push(y);
-    }
-    return seen;
-  };
+  let children = new Map<string, string[]>();
+  let parents = new Map<string, string[]>();
+  let ancOf = new Map<string, Set<string>>();
+  let descOf = new Map<string, Set<string>>();
 
   function rebuildRelations(): void {
-    children.clear(); parents.clear(); ancOf.clear(); descOf.clear();
-    g.nodes.forEach(n => { children.set(n.id, []); parents.set(n.id, []); });
-    g.edges.forEach(e => { children.get(e.from)!.push(e.to); parents.get(e.to)!.push(e.from); });
-    g.nodes.forEach(n => { ancOf.set(n.id, reach(n.id, parents)); descOf.set(n.id, reach(n.id, children)); });
+    const rel = computeRelations({ nodes: getNodes().slice(), edges: getEdges().slice() });
+    children = rel.children; parents = rel.parents; ancOf = rel.ancOf; descOf = rel.descOf;
   }
   rebuildRelations();
 
@@ -374,133 +271,31 @@ function render(container: HTMLElement, g: GraphDef): void {
   let canvasW = 0, canvasH = 0;
   let scrollDomain = COL_W;
 
-  function bezierPath(a: [number, number][]): string {
-    let d = `M ${a[0][0].toFixed(1)} ${a[0][1].toFixed(1)}`;
-    for (let i = 1; i < a.length; i++) {
-      const [x0, y0] = a[i - 1], [x1, y1] = a[i];
-      const h = (x1 - x0) * BEZIER;
-      d += ` C ${(x0 + h).toFixed(1)} ${y0.toFixed(1)},` +
-           ` ${(x1 - h).toFixed(1)} ${y1.toFixed(1)},` +
-           ` ${x1.toFixed(1)} ${y1.toFixed(1)}`;
-    }
-    return d;
-  }
-
-  // Re-run the layout algorithm over whichever nodes/edges are currently
-  // included, and paint the result onto the persistent DOM. No new graph
-  // object is retained anywhere — `induced` is thrown away once this returns.
-  // Returns the new maxRank.
+  // Re-run the layout algorithm (layout.ts, given each node's measured size)
+  // over whichever nodes/edges are currently included, and paint the result
+  // onto the persistent DOM. No new graph object is retained anywhere —
+  // `induced` is thrown away once this returns. Returns the new maxRank.
   function relayout(): number {
-    const inducedNodes = g.nodes.filter(n => included(n.id));
-    const inducedEdges = g.edges.filter(e => included(e.from) && included(e.to));
+    const inducedNodes = getNodes().filter(n => included(n.id));
+    const inducedEdges = getEdges().filter(e => included(e.from) && included(e.to));
     const induced: GraphDef = { nodes: inducedNodes, edges: inducedEdges };
 
     rankMap = computeRanks(induced);
     maxRank = inducedNodes.length ? Math.max(...inducedNodes.map(n => rankMap.get(n.id)!)) : 0;
 
-    byRank = []; for (let r = 0; r <= maxRank; r++) byRank[r] = [];
+    const sizes = new Map<string, NodeSize>();
     inducedNodes.forEach(def => {
       const ln = nodes.get(def.id)!;
-      ln.rank = rankMap.get(def.id)!;
-      byRank[ln.rank].push(ln);
+      sizes.set(def.id, { width: ln.width, height: ln.height });
     });
-    byRank.forEach(list => list.forEach((ln, i) => { ln.orderInRank = i; }));
-    const nodeNorm = (ln: LaidNode) => (ln.orderInRank + 0.5) / byRank[ln.rank].length;
+    const layout = computeLayout(induced, rankMap, maxRank, sizes);
+    canvasW = layout.canvasW; canvasH = layout.canvasH; scrollDomain = layout.scrollDomain;
 
-    const columns: Place[][] = []; for (let r = 0; r <= maxRank; r++) columns[r] = [];
-    const nodePlace = new Map<string, Place>();
-    const gapPlace = new Map<string, Place>();     // key: "edgeKey@rank"
-
-    inducedNodes.forEach(def => {
-      const ln = nodes.get(def.id)!;
-      const p: Place = {
-        kind: "node", rank: ln.rank, half: ln.height / 2 + NODE_PAD, weight: 1,
-        order: nodeNorm(ln), center: 0, desired: 0, node: ln,
-      };
-      nodePlace.set(def.id, p);
-      columns[ln.rank].push(p);
+    byRank = layout.byRank.map(ids => ids.map(id => nodes.get(id)!));
+    layout.positions.forEach((pos, id) => {
+      const ln = nodes.get(id)!;
+      ln.rank = pos.rank; ln.orderInRank = pos.orderInRank; ln.x = pos.x; ln.y = pos.y;
     });
-
-    inducedEdges.forEach(e => {
-      const ru = rankMap.get(e.from)!, rw = rankMap.get(e.to)!;
-      if (rw - ru <= 1) return;
-      const s = nodeNorm(nodes.get(e.from)!), t = nodeNorm(nodes.get(e.to)!);
-      for (let r = ru + 1; r < rw; r++) {
-        const f = (r - ru) / (rw - ru);
-        const p: Place = {
-          kind: "gap", rank: r, half: GAP_H / 2 + GAP_PAD, weight: 1.5,
-          order: s + (t - s) * f, center: 0, desired: 0, edgeKey: edgeKey(e),
-        };
-        gapPlace.set(edgeKey(e) + "@" + r, p);
-        columns[r].push(p);
-      }
-    });
-    columns.forEach(col => col.sort((a, b) => a.order - b.order));
-
-    const neighbours = new Map<Place, Place[]>();
-    const link = (a: Place, b: Place) => {
-      (neighbours.get(a) || neighbours.set(a, []).get(a)!).push(b);
-      (neighbours.get(b) || neighbours.set(b, []).get(b)!).push(a);
-    };
-    inducedEdges.forEach(e => {
-      const ru = rankMap.get(e.from)!, rw = rankMap.get(e.to)!;
-      const chain: Place[] = [nodePlace.get(e.from)!];
-      for (let r = ru + 1; r < rw; r++) chain.push(gapPlace.get(edgeKey(e) + "@" + r)!);
-      chain.push(nodePlace.get(e.to)!);
-      for (let k = 0; k < chain.length - 1; k++) link(chain[k], chain[k + 1]);
-    });
-
-    columns.forEach(col => {
-      let y = 0;
-      col.forEach((p, i) => {
-        if (i > 0) y += col[i - 1].half + p.half;
-        p.center = y;
-      });
-    });
-    const allPlaces: Place[] = ([] as Place[]).concat(...columns);
-    for (let it = 0; it < ITERS; it++) {
-      for (const p of allPlaces) {
-        const nb = neighbours.get(p);
-        p.desired = nb && nb.length
-          ? nb.reduce((s, q) => s + q.center, 0) / nb.length
-          : p.center;
-      }
-      columns.forEach(projectColumn);
-    }
-
-    // Normalise so the topmost place sits just below the label band.
-    let minTop = Infinity, maxBot = LABEL_BAND;
-    allPlaces.forEach(p => { minTop = Math.min(minTop, p.center - p.half); });
-    if (allPlaces.length) {
-      const shift = LABEL_BAND + NODE_PAD - minTop;
-      allPlaces.forEach(p => { p.center += shift; });
-      inducedNodes.forEach(def => {
-        const ln = nodes.get(def.id)!;
-        const p = nodePlace.get(def.id)!;
-        ln.x = nodeLeftX(ln.rank);
-        ln.y = p.center - ln.height / 2;
-        maxBot = Math.max(maxBot, ln.y + ln.height);
-      });
-    }
-
-    canvasW = 2 * MARGIN + (maxRank + 1) * COL_W;
-    canvasH = maxBot + MARGIN;
-    scrollDomain = (maxRank + 1) * COL_W;
-
-    // Anchors: source-right, then (enter,exit) across each intermediate gap,
-    // then target-left. Every anchor has a horizontal tangent, so flats stay
-    // flat and the between-column joins ease smoothly.
-    function edgeAnchors(e: EdgeDef): [number, number][] {
-      const ru = rankMap.get(e.from)!, rw = rankMap.get(e.to)!;
-      const a: [number, number][] = [[nodeRightX(ru), nodePlace.get(e.from)!.center]];
-      for (let r = ru + 1; r < rw; r++) {
-        const y = gapPlace.get(edgeKey(e) + "@" + r)!.center;
-        a.push([nodeLeftX(r), y]);
-        a.push([nodeRightX(r), y]);
-      }
-      a.push([nodeLeftX(rw), nodePlace.get(e.to)!.center]);
-      return a;
-    }
 
     // Paint: nodes.
     const includedSet = new Set(inducedNodes.map(n => n.id));
@@ -518,11 +313,11 @@ function render(container: HTMLElement, g: GraphDef): void {
 
     // Paint: edges.
     const includedEdgeKeys = new Set(inducedEdges.map(edgeKey));
-    g.edges.forEach((e, i) => {
+    getEdges().forEach((e, i) => {
       const rec = edgeRecs[i];
       if (includedEdgeKeys.has(edgeKey(e))) {
         rec.el.style.display = "";
-        rec.el.setAttribute("d", bezierPath(edgeAnchors(e)));
+        rec.el.setAttribute("d", bezierPath(layout.edgeAnchors.get(edgeKey(e))!));
       } else {
         rec.el.style.display = "none";
       }
@@ -1382,7 +1177,7 @@ function render(container: HTMLElement, g: GraphDef): void {
     if (!selectedIds.length) return;
     const target = focusTargetSet(selectedIds);
     const newExcluded = new Set<string>();
-    g.nodes.forEach(n => { if (!target.has(n.id)) newExcluded.add(n.id); });
+    getNodes().forEach(n => { if (!target.has(n.id)) newExcluded.add(n.id); });
     const oldMaxRank = maxRank;
     focusStack.push(excluded);
     excluded = newExcluded;
@@ -1592,8 +1387,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   // Apply title/body edits onto the node actually being edited.
   function updateNodeContent(id: string, title: string, body: string): void {
     const ln = nodes.get(id); if (!ln) return;
-    ln.def.title = title;
-    ln.def.body = body || undefined;
+    updateNode(id, title, body || undefined);
     (ln.el.querySelector(".dag-node-title") as HTMLDivElement).textContent = title;
     let bodyEl = ln.el.querySelector(".dag-node-body") as HTMLDivElement | null;
     if (body) {
@@ -1679,35 +1473,29 @@ function render(container: HTMLElement, g: GraphDef): void {
     handlePaneKeydown(ev);
   });
 
-  const addEdgeRaw = (from: string, to: string): void => { g.edges.push({ from, to }); };
-  const removeEdge = (from: string, to: string): void => {
-    const i = g.edges.findIndex(e => e.from === from && e.to === to);
-    if (i >= 0) g.edges.splice(i, 1);
-  };
-  const hasEdge = (from: string, to: string): boolean => g.edges.some(e => e.from === from && e.to === to);
-
-  // After `g.nodes`/`g.edges` change: recolour/redraw edges, recompute
+  // After the graph's nodes/edges change: recolour/redraw edges, recompute
   // ancestor/descendant relations, grow the rank pools if the graph now needs
   // more of them (it can only ever need more, never fewer), and relay out.
   function syncGraphStructure(): void {
     rebuildEdgeRecs();
     rebuildRelations();
-    const newFullRankMap = computeRanks(g);
-    const newMaxRank0 = Math.max(...g.nodes.map(n => newFullRankMap.get(n.id)!));
+    const fullGraph: GraphDef = { nodes: getNodes().slice(), edges: getEdges().slice() };
+    const newFullRankMap = computeRanks(fullGraph);
+    const newMaxRank0 = Math.max(...fullGraph.nodes.map(n => newFullRankMap.get(n.id)!));
     if (newMaxRank0 > maxRank0) growRankPools(newMaxRank0);
     relayout();
   }
 
-  // Add a new node to the (single, never-duplicated) graph `g`, wire it to
+  // Add a new node to the (single, never-duplicated) graph, wire it to
   // whatever's currently in banks A/D per the two flags, and bring the
   // persistent DOM up to date. Never touches selection or scroll position —
   // adding a node can only ever need as many or more ranks, never fewer.
   function addNode(title: string, body: string, useA: boolean, useD: boolean): void {
     const id = "N" + nextNodeSeq++;
     const def: NodeDef = { id, title, body: body || undefined };
-    g.nodes.push(def);
-    if (useA && bankA) bankA.forEach(a => addEdgeRaw(a, id));
-    if (useD && bankD) bankD.forEach(d => addEdgeRaw(id, d));
+    graphAddNode(def);
+    if (useA && bankA) bankA.forEach(a => addEdge(a, id));
+    if (useD && bankD) bankD.forEach(d => addEdge(id, d));
 
     addNodeCard(def);
     syncGraphStructure();
@@ -1728,9 +1516,9 @@ function render(container: HTMLElement, g: GraphDef): void {
       target.forEach(v => {
         const [from, to] = source === "A" ? [u, v] : [v, u];   // A: u is v's parent; D: v is u's parent
         if (hasEdge(from, to)) {
-          if (!union) { removeEdge(from, to); changed = true; }
+          if (!union) { deleteEdge(from, to); changed = true; }
         } else if (!ancOf.get(from)!.has(to)) {                 // would `to` already be an ancestor of `from`?
-          addEdgeRaw(from, to); changed = true;
+          addEdge(from, to); changed = true;
         }
       });
     });
@@ -1746,12 +1534,12 @@ function render(container: HTMLElement, g: GraphDef): void {
     let changed = false;
     if (bankA && bankS) {
       bankA.forEach(a => bankS!.forEach(s => {
-        if (!hasEdge(a, s) && !ancOf.get(a)!.has(s)) { addEdgeRaw(a, s); changed = true; }
+        if (!hasEdge(a, s) && !ancOf.get(a)!.has(s)) { addEdge(a, s); changed = true; }
       }));
     }
     if (bankD && bankS) {
       bankS.forEach(s => bankD!.forEach(d => {
-        if (!hasEdge(s, d) && !ancOf.get(s)!.has(d)) { addEdgeRaw(s, d); changed = true; }
+        if (!hasEdge(s, d) && !ancOf.get(s)!.has(d)) { addEdge(s, d); changed = true; }
       }));
     }
     if (changed) syncGraphStructure();
@@ -1781,8 +1569,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   function deleteNodes(ids: string[]): void {
     const idSet = new Set(ids.filter(id => nodes.has(id)));
     if (!idSet.size) return;
-    g.nodes = g.nodes.filter(n => !idSet.has(n.id));
-    g.edges = g.edges.filter(e => !idSet.has(e.from) && !idSet.has(e.to));
+    graphDeleteNodes(idSet);
     idSet.forEach(id => {
       nodes.get(id)!.el.remove();                 // takes its tally/badge children with it
       nodes.delete(id);
