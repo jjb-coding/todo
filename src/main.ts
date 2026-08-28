@@ -1664,16 +1664,14 @@ function render(container: HTMLElement, initial: GraphDef): void {
     if (e.ctrlKey && (k === "a" || k === "A")) {
       e.preventDefault();
       if (bankADisabled) overwriteBound("A");
-      // An empty bank can't be toggled on — instead, act as if A were pressed
-      // with the DAG in focus (banks the current selection, and toggles this
-      // same flag as a side effect of setBank).
       else if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
-      else pressBank("A");
+      // Empty, enabled bank: there's nothing to attach and nothing to toggle,
+      // so Ctrl+A does nothing here — it must not quietly bank the selection.
     } else if (e.ctrlKey && (k === "d" || k === "D")) {
       e.preventDefault();
       if (bankDDisabled) overwriteBound("D");
       else if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
-      else pressBank("D");
+      // Empty, enabled bank: Ctrl+D does nothing (see Ctrl+A above).
     } else if (e.ctrlKey && k === "Enter") {
       e.preventDefault();
       if (lastEditorMode === "existing") commitExisting(); else commitNew();
@@ -2160,7 +2158,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     }
     if (k === "a" || k === "A") {
       e.preventDefault();
-      if (e.ctrlKey) { ensureBankS(); wireBankToS("A", e.shiftKey); }
+      // Ctrl+A wires bank A onto S. With A empty there's nothing to wire, so
+      // it does nothing — in particular it must not quietly bank the selection
+      // into S via ensureBankS().
+      if (e.ctrlKey) { if (bankA) { ensureBankS(); wireBankToS("A", e.shiftKey); } }
       else if (e.altKey) clearBankA();
       else if (e.shiftKey) toggleBankMembership("A", selectedIds);
       else pressBank("A");
@@ -2168,7 +2169,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     }
     if (k === "d" || k === "D") {
       e.preventDefault();
-      if (e.ctrlKey) { ensureBankS(); wireBankToS("D", e.shiftKey); }
+      if (e.ctrlKey) { if (bankD) { ensureBankS(); wireBankToS("D", e.shiftKey); } }  // D empty -> nothing (see Ctrl+A)
       else if (e.altKey) clearBankD();
       else if (e.shiftKey) toggleBankMembership("D", selectedIds);
       else pressBank("D");
