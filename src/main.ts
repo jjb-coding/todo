@@ -24,7 +24,7 @@ import {
 } from "./layout";
 import type { NodeSize } from "./layout";
 import { getSettings, setSettingValue } from "./settings";
-import type { FollowMode } from "./settings";
+import type { FollowMode, EdgeConflictMode } from "./settings";
 
 interface LaidNode {
   def: NodeDef;
@@ -1080,9 +1080,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
   setting1Btn.className = "dag-settingbtn"; setting1Btn.type = "button"; setting1Btn.textContent = "1";
   const setting2Btn = document.createElement("button");
   setting2Btn.className = "dag-settingbtn"; setting2Btn.type = "button"; setting2Btn.textContent = "2";
+  const setting3Btn = document.createElement("button");
+  setting3Btn.className = "dag-settingbtn"; setting3Btn.type = "button"; setting3Btn.textContent = "3";
   const groupSettings = document.createElement("div");
   groupSettings.className = "dag-bargroup";
-  groupSettings.append(setting1Btn, setting2Btn);
+  groupSettings.append(setting1Btn, setting2Btn, setting3Btn);
 
   bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
@@ -1121,8 +1123,27 @@ function render(container: HTMLElement, initial: GraphDef): void {
     setSettingValue("followSelection", next);
     updateSetting2Btn();
   });
+  // [3] edgeConflictResolution: 3-state cycle, block -> remove-parent -> remove-child.
+  function updateSetting3Btn(): void {
+    const s = getSettings().edgeConflictResolution;
+    setting3Btn.style.display = s.showOnBar ? "" : "none";
+    setting3Btn.textContent = s.value === "block" ? "B" : s.value === "remove-parent" ? "P" : "C";
+    setting3Btn.classList.toggle("edge-remove-parent", s.value === "remove-parent");
+    setting3Btn.classList.toggle("edge-remove-child", s.value === "remove-child");
+    setting3Btn.title = `Setting — when a drag-created edge would break A/S/D bank ordering: ${
+      s.value === "block" ? "block the edge" :
+      s.value === "remove-parent" ? "create it, dropping the offending parent from its bank" :
+      "create it, dropping the offending child from its bank"} (click to cycle)`;
+  }
+  setting3Btn.addEventListener("click", () => {
+    const cur = getSettings().edgeConflictResolution.value;
+    const next: EdgeConflictMode = cur === "block" ? "remove-parent" : cur === "remove-parent" ? "remove-child" : "block";
+    setSettingValue("edgeConflictResolution", next);
+    updateSetting3Btn();
+  });
   updateSetting1Btn();
   updateSetting2Btn();
+  updateSetting3Btn();
 
   // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
   // distinct from the coloured-drop-shadow/dotted-outline selection scheme.
@@ -1925,7 +1946,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       else { refresh(); applyFocus([id], HOVER, false); }            // deselected but still hovering
     });
     ln.el.addEventListener("mouseenter", () => {
-      if (boxBtn !== -1) return;                                     // mid box-sweep: no hover preview
+      if (boxBtn !== -1 || edgeDragFrom !== null) return;            // mid box-sweep / edge-drag: no hover preview
       if (selMode === "edit") return;                                // no hover preview in edit mode
       if (mode !== "idle") { updateCursors(); return; }              // a committed view is frozen
       applyFocus([id], HOVER, false);
@@ -1941,6 +1962,15 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (selMode === "edit" && ev.button === 1 && !ev.shiftKey) {   // Shift+middle -> box sweep instead
         ev.preventDefault();
         editBankClick("S", id, ev.shiftKey);
+        return;
+      }
+      // Plain left-press on a node arms an edge drag; it only becomes one once
+      // the pointer moves past the threshold (otherwise the click selects).
+      if (ev.button === 0 && !ev.shiftKey && !ev.ctrlKey && !ev.altKey) {
+        ev.preventDefault();
+        edgeDragFrom = id;
+        edgeDragActive = false;
+        [edgeX0, edgeY0] = boxLocalPt(ev);
       }
     });
     // Right-click: in edit mode, red/D (its usual meaning is replaced, as
@@ -2087,6 +2117,105 @@ function render(container: HTMLElement, initial: GraphDef): void {
   document.addEventListener("contextmenu", ev => {
     if (boxDragJustFinished || boxActive) { ev.preventDefault(); ev.stopPropagation(); }
   }, true);
+
+  // ---- Drag between two nodes to create an edge ---------------------------
+  // Left-press a node, drag to another, release: the first becomes a parent
+  // of the second. Refused if it would close a cycle. If it would break the
+  // A ≺ S ≺ D bank ordering, setting [3] decides: block, or create anyway and
+  // drop the offending parent / child from its bank.
+  let edgeDragFrom: string | null = null;
+  let edgeDragActive = false;
+  let edgeX0 = 0, edgeY0 = 0;
+  const EDGE_THRESH = 4;
+  const edgeDragLine = document.createElementNS(SVG, "line");
+  edgeDragLine.setAttribute("stroke", "#2563eb");
+  edgeDragLine.setAttribute("stroke-width", "2");
+  edgeDragLine.setAttribute("stroke-dasharray", "5 4");
+  edgeDragLine.setAttribute("marker-end", "url(#arrow-0)");
+  edgeDragLine.style.pointerEvents = "none";
+  edgeDragLine.style.display = "none";
+  svg.appendChild(edgeDragLine);
+
+  const nodeAtPoint = (x: number, y: number): string | null => {
+    let hit: string | null = null;
+    nodes.forEach((ln, id) => {
+      if (!included(id) || ln.el.style.display === "none") return;
+      if (x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height) hit = id;
+    });
+    return hit;
+  };
+  // Banked-node pairs whose ancestry would invert (a lower bank becoming an
+  // ancestor of a higher one) once edge from->to exists.
+  function edgeBankConflicts(from: string, to: string): { parent: string; child: string }[] {
+    const aSet = bankADisabled ? boundA : bankA;
+    const dSet = bankDDisabled ? boundD : bankD;
+    const sSet = bankSDisabled ? null : bankS;
+    const ranked: { id: string; r: number }[] = [];
+    aSet?.forEach(id => ranked.push({ id, r: 0 }));
+    sSet?.forEach(id => ranked.push({ id, r: 1 }));
+    dSet?.forEach(id => ranked.push({ id, r: 2 }));
+    const ancEq = (x: string, y: string): boolean => x === y || ancOf.get(y)!.has(x);
+    // x becomes an ancestor of y only because of the new from->to edge
+    // (a pre-existing inversion isn't this edge's fault, so don't act on it).
+    const newlyAnc = (x: string, y: string): boolean =>
+      !ancOf.get(y)!.has(x) && ancEq(x, from) && ancEq(to, y);
+    const out: { parent: string; child: string }[] = [];
+    for (const p of ranked)
+      for (const c of ranked)
+        if (p.r > c.r && p.id !== c.id && newlyAnc(p.id, c.id)) out.push({ parent: p.id, child: c.id });
+    return out;
+  }
+  function tryCreateEdge(from: string, to: string): void {
+    if (from === to || hasEdge(from, to) || ancOf.get(from)!.has(to)) return;   // exists, or would cycle
+    const conflicts = edgeBankConflicts(from, to);
+    if (conflicts.length) {
+      const how = getSettings().edgeConflictResolution.value;
+      if (how === "block") return;
+      conflicts.forEach(c => removeFromBanks(how === "remove-parent" ? c.parent : c.child));
+    }
+    addEdge(from, to);
+    syncGraphStructure();
+    paintBankBadges();
+    refresh();
+  }
+  const clearEdgeDrag = (): void => {
+    edgeDragFrom = null; edgeDragActive = false;
+    edgeDragLine.style.display = "none";
+    nodes.forEach(ln => ln.el.classList.remove("edge-drop", "edge-drop-no"));
+  };
+  window.addEventListener("mousemove", ev => {
+    if (edgeDragFrom === null) return;
+    const [x, y] = boxLocalPt(ev);
+    if (!edgeDragActive) {
+      if (Math.abs(x - edgeX0) < EDGE_THRESH && Math.abs(y - edgeY0) < EDGE_THRESH) return;
+      edgeDragActive = true;
+      const src = nodes.get(edgeDragFrom)!;
+      edgeDragLine.setAttribute("x1", String(src.x + src.width / 2));
+      edgeDragLine.setAttribute("y1", String(src.y + src.height / 2));
+      edgeDragLine.style.display = "";
+      svg.appendChild(edgeDragLine);   // keep it on top
+    }
+    edgeDragLine.setAttribute("x2", String(x));
+    edgeDragLine.setAttribute("y2", String(y));
+    const over = nodeAtPoint(x, y);
+    nodes.forEach((ln, nid) => {
+      const bad = over === edgeDragFrom || hasEdge(edgeDragFrom!, over || "") || (!!over && ancOf.get(edgeDragFrom!)!.has(over));
+      ln.el.classList.toggle("edge-drop", nid === over && nid !== edgeDragFrom && !bad);
+      ln.el.classList.toggle("edge-drop-no", nid === over && (nid === edgeDragFrom || bad));
+    });
+  });
+  window.addEventListener("mouseup", ev => {
+    if (edgeDragFrom === null) return;
+    const from = edgeDragFrom, wasActive = edgeDragActive;
+    if (wasActive) {
+      const [x, y] = boxLocalPt(ev);
+      const to = nodeAtPoint(x, y);
+      if (to && to !== from) tryCreateEdge(from, to);
+      boxDragJustFinished = true;                       // swallow the trailing click
+      setTimeout(() => { boxDragJustFinished = false; }, 0);
+    }
+    clearEdgeDrag();
+  });
 
   // ---- Keyboard focus partitions ---------------------------------------------
   // Three coarse regions share the keyboard: the DAG view, the icon bar, and

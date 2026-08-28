@@ -351,6 +351,16 @@ body {
 }
 .dag-nodebox-flag.stale { box-shadow: 0 0 0 1px rgba(224, 168, 0, 0.4); border-radius: 2px; }
 
+/* Drag-to-create-edge: outline (never reflows) on the node under the pointer —
+   blue if the edge can be made, red if it can't (self / duplicate / cycle). */
+.dag-node.edge-drop { outline: 2.5px solid rgba(37, 99, 235, 0.95) !important; outline-offset: 2px !important; }
+.dag-node.edge-drop-no { outline: 2.5px solid rgba(224, 49, 49, 0.95) !important; outline-offset: 2px !important; }
+
+/* [3] edgeConflictResolution: "block" is the plain state; the two remove modes
+   borrow the amber / teal used elsewhere for parent / child accents. */
+.dag-statusbar .dag-settingbtn.edge-remove-parent { background: #b7791f; border-color: #d9a441; color: #1b1200; }
+.dag-statusbar .dag-settingbtn.edge-remove-child { background: #0d9488; border-color: #0a756c; color: #eafffb; }
+
 /* Shift-drag selection rectangle — a transient overlay, never affects layout. */
 .dag-boxsel {
   position: absolute; z-index: 30; pointer-events: none;
