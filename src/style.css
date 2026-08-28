@@ -336,4 +336,12 @@ body {
 .dag-nodebox-flag.d::before { left: 0; background: rgb(224, 49, 49); }
 .dag-nodebox-flag.d::after { left: 4px; background: rgb(224, 49, 49); }
 
+/* Shift-drag selection rectangle — a transient overlay, never affects layout. */
+.dag-boxsel {
+  position: absolute; z-index: 30; pointer-events: none;
+  border: 1.5px dashed rgba(37, 99, 235, 0.9);
+  background: rgba(37, 99, 235, 0.10);
+  border-radius: 3px;
+}
+
 #err { color: #ff8a8a; font-family: ui-monospace, monospace; white-space: pre-wrap; padding: 12px; }

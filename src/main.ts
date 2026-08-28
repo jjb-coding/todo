@@ -169,10 +169,49 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // --- Edge colouring: <=4 hues, keep shared-endpoint edges distinct ---------
   // Rebuilt from scratch on demand (addNode) — simplest way to keep colouring
   // consistent as edges are added, and cheap at this scale.
-  const edgeRecs: { from: string; to: string; el: SVGElement }[] = [];
+  interface EdgeRec {
+    from: string; to: string;
+    el: SVGElement;    // the visible, decorative path
+    hit: SVGElement;   // a fat transparent path that actually catches the mouse
+    color: string;
+    hoverW?: number;   // stroke-width to restore when a hover ends
+  }
+  const edgeRecs: EdgeRec[] = [];
+  const activeEdges = new Set<number>();   // indices emphasised by the current applyFocus
+  let hoveredEdge: number | null = null;
+
+  // Whether edge `i` responds to the mouse right now. In Union/Intersection
+  // with a committed selection only the emphasised (active) edges do; with no
+  // selection, or in Edit / rank mode, every visible edge does.
+  function edgeTargetable(i: number): boolean {
+    if (edgeRecs[i].el.style.display === "none") return false;
+    if (selMode === "edit") return true;
+    if ((mode === "nodes" || mode === "subselect") && selectedIds.length) return activeEdges.has(i);
+    return true;
+  }
+  function setEdgeHover(i: number, on: boolean): void {
+    const rec = edgeRecs[i];
+    if (on) {
+      if (rec.hoverW === undefined)
+        rec.hoverW = parseFloat(rec.el.getAttribute("stroke-width") || "2");
+      rec.el.setAttribute("stroke-width", (rec.hoverW + 2.5).toFixed(1));
+      rec.el.style.filter = `drop-shadow(0 0 3px ${rec.color})`;   // a glow — unlike the fade/emphasis scheme
+      rec.el.style.opacity = "1";
+      svg.appendChild(rec.el);                                     // lift it above its neighbours
+    } else {
+      rec.el.setAttribute("stroke-width", String(rec.hoverW ?? 2));
+      rec.el.style.filter = "";
+      rec.hoverW = undefined;
+    }
+  }
+  function clearEdgeHover(): void {
+    if (hoveredEdge !== null) { setEdgeHover(hoveredEdge, false); hoveredEdge = null; }
+  }
   function rebuildEdgeRecs(): void {
-    edgeRecs.forEach(r => r.el.remove());
+    edgeRecs.forEach(r => { r.el.remove(); r.hit.remove(); });
     edgeRecs.length = 0;
+    activeEdges.clear();
+    hoveredEdge = null;
     const E = getEdges();
     const conflict: number[][] = E.map(() => []);
     for (let i = 0; i < E.length; i++)
@@ -208,8 +247,36 @@ function render(container: HTMLElement, initial: GraphDef): void {
       path.setAttribute("stroke-width", "2");
       path.setAttribute("stroke-linecap", "round");
       path.setAttribute("marker-end", `url(#arrow-${edgeColor[i]})`);
-      svg.appendChild(path);   // appended last -> always in front of rank rects
-      edgeRecs.push({ from: e.from, to: e.to, el: path });
+      path.style.pointerEvents = "none";   // the fat hit path below does the catching
+      svg.appendChild(path);               // appended last -> always in front of rank rects
+
+      const hit = document.createElementNS(SVG, "path");
+      hit.setAttribute("fill", "none");
+      hit.setAttribute("stroke", "transparent");
+      hit.setAttribute("stroke-width", "14");
+      hit.style.pointerEvents = "stroke";
+      svg.appendChild(hit);
+
+      const rec: EdgeRec = { from: e.from, to: e.to, el: path, hit, color: PALETTE[edgeColor[i]] };
+      edgeRecs.push(rec);
+
+      hit.addEventListener("mouseenter", () => {
+        if (!edgeTargetable(i)) { hit.style.cursor = ""; return; }
+        hit.style.cursor = "pointer";
+        clearEdgeHover();
+        hoveredEdge = i;
+        setEdgeHover(i, true);
+      });
+      hit.addEventListener("mouseleave", () => { if (hoveredEdge === i) clearEdgeHover(); });
+      hit.addEventListener("contextmenu", ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!edgeTargetable(i)) return;
+        clearEdgeHover();
+        deleteEdge(rec.from, rec.to);
+        syncGraphStructure();
+        refresh();
+      });
     });
   }
   rebuildEdgeRecs();
@@ -319,10 +386,14 @@ function render(container: HTMLElement, initial: GraphDef): void {
     getEdges().forEach((e, i) => {
       const rec = edgeRecs[i];
       if (includedEdgeKeys.has(edgeKey(e))) {
+        const d = bezierPath(layout.edgeAnchors.get(edgeKey(e))!);
         rec.el.style.display = "";
-        rec.el.setAttribute("d", bezierPath(layout.edgeAnchors.get(edgeKey(e))!));
+        rec.hit.style.display = "";
+        rec.el.setAttribute("d", d);
+        rec.hit.setAttribute("d", d);
       } else {
         rec.el.style.display = "none";
+        rec.hit.style.display = "none";
       }
     });
 
@@ -372,7 +443,9 @@ function render(container: HTMLElement, initial: GraphDef): void {
     });
     nodeTally.forEach(t => { t.style.display = "none"; t.innerHTML = ""; });
     nodeEnum.forEach(e => { e.style.display = "none"; });
-    edgeRecs.forEach(r => { r.el.setAttribute("stroke-width", "2"); r.el.style.opacity = "1"; });
+    clearEdgeHover();
+    activeEdges.clear();
+    edgeRecs.forEach(r => { r.el.setAttribute("stroke-width", "2"); r.el.style.opacity = "1"; r.el.style.filter = ""; });
     colRects.forEach(c => {
       c.el.setAttribute("fill", rgbStr(NEUTRAL_COL[c.parity]));
       c.el.setAttribute("stroke", "none");
@@ -489,9 +562,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
       }
     });
 
-    edgeRecs.forEach(r => {
+    edgeRecs.forEach((r, i) => {
       const active = (setA.has(r.from) && setA.has(r.to)) || (setD.has(r.from) && setD.has(r.to));
       if (active) {
+        activeEdges.add(i);
         r.el.setAttribute("stroke-width", (2 + 1.8 * s).toFixed(1));
         r.el.style.opacity = "1";
         svg.appendChild(r.el);           // bring active edges to the front
@@ -685,6 +759,27 @@ function render(container: HTMLElement, initial: GraphDef): void {
     editorUseD = false; updateEditorFlags();
     paintBankBadges(); refresh();
   }
+  // Ctrl+Left / Ctrl+Right with the DAG in focus: move bank S's contents
+  // wholesale into bank D / A, emptying S and whatever the destination held.
+  // A disabled or empty S does nothing; a disabled destination is re-enabled.
+  function moveBankSInto(letter: "A" | "D"): void {
+    if (bankSDisabled || !bankS || !bankS.size) return;
+    const ids = Array.from(bankS);
+    stripBankHover(bankS);
+    bankS = null;
+    if (letter === "A") {
+      stripBankHover(bankA);
+      bankADisabled = false; boundA = null;
+      bankA = new Set(ids);
+    } else {
+      stripBankHover(bankD);
+      bankDDisabled = false; boundD = null;
+      bankD = new Set(ids);
+    }
+    paintBankBadges();
+    refresh();
+  }
+
   // The set wireBankToS should treat as "S" — the real bank, unless it's been
   // disabled, in which case the current selection stands in for it directly
   // (and is never itself recorded into the bank).
@@ -939,7 +1034,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   aBtn.title = "Bank A — A banks/arms, Shift+A toggles membership, Alt+A clears, Ctrl+A/Ctrl+Shift+A wire it onto S as parents, right-click disables (Ctrl+A in the editor then binds the selection directly, without banking it), hold C then A to centre on it";
   const sBtn = document.createElement("button");
   sBtn.className = "dag-bankbtn s"; sBtn.type = "button"; sBtn.textContent = "S";
-  sBtn.title = "Bank S — S banks/arms, Shift+S toggles membership, Alt+S clears, right-click disables (S's wiring actions then use the selection directly), hold C then S to centre on it";
+  sBtn.title = "Bank S — S banks/arms, Shift+S toggles membership, Alt+S clears, right-click disables (S's wiring actions then use the selection directly), Ctrl+Left/Ctrl+Right moves its contents into bank D/A, hold C then S to centre on it";
   const dBtn = document.createElement("button");
   dBtn.className = "dag-bankbtn d"; dBtn.type = "button"; dBtn.textContent = "D";
   dBtn.title = "Bank D — D banks/arms, Shift+D toggles membership, Alt+D clears, Ctrl+D/Ctrl+Shift+D wire it onto S as children, right-click disables (Ctrl+D in the editor then binds the selection directly, without banking it), hold C then D to centre on it";
@@ -1754,6 +1849,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       else { refresh(); applyFocus([id], HOVER, false); }            // deselected but still hovering
     });
     ln.el.addEventListener("mouseenter", () => {
+      if (boxBtn !== -1) return;                                     // mid box-sweep: no hover preview
       if (selMode === "edit") return;                                // no hover preview in edit mode
       if (mode !== "idle") { updateCursors(); return; }              // a committed view is frozen
       applyFocus([id], HOVER, false);
@@ -1766,22 +1862,149 @@ function render(container: HTMLElement, initial: GraphDef): void {
     // so it's caught on mousedown instead (also preventing its usual
     // autoscroll gesture).
     ln.el.addEventListener("mousedown", ev => {
-      if (selMode === "edit" && ev.button === 1) {
+      if (selMode === "edit" && ev.button === 1 && !ev.shiftKey) {   // Shift+middle -> box sweep instead
         ev.preventDefault();
         editBankClick("S", id, ev.shiftKey);
       }
     });
     // Right-click: in edit mode, red/D (its usual meaning is replaced, as
-    // noted in the mode's own docs). Otherwise: clear this node's bank
-    // membership. Shift+right-click always deletes it outright, in every
-    // mode, regardless of the current selection.
+    // noted in the mode's own docs) — and there Shift behaves exactly like
+    // Shift+left/middle-click, toggling membership rather than deleting.
+    // Outside edit mode: clear this node's bank membership, or, with Shift,
+    // delete it outright regardless of the current selection.
     ln.el.addEventListener("contextmenu", ev => {
       ev.preventDefault();
+      if (selMode === "edit") { editBankClick("D", id, ev.shiftKey); return; }
       if (ev.shiftKey) { deleteNodes([id]); return; }
-      if (selMode === "edit") { editBankClick("D", id, false); return; }
       if (removeFromBanks(id)) { paintBankBadges(); updateBar(); }
     });
   }
+
+  // ---- Shift-drag box selection -------------------------------------------
+  // Hold Shift and drag (any button) to sweep a rectangle over the DAG. On
+  // release, with at least one node enclosed:
+  //   Union / Intersection — Left adds the enclosed nodes to the selection
+  //                          (exactly as Shift+click does); Right deletes them.
+  //   Edit                 — Left / Middle / Right add them to bank A / S / D.
+  // A Shift press that never passes the drag threshold falls through to the
+  // normal per-node click.
+  const boxEl = document.createElement("div");
+  boxEl.className = "dag-boxsel";
+  boxEl.style.display = "none";
+  container.appendChild(boxEl);
+
+  let boxBtn = -1;                 // -1 = idle, else the mouse button held
+  let boxX0 = 0, boxY0 = 0;
+  let boxActive = false;           // past the threshold — a real sweep, not a click
+  let boxDragJustFinished = false; // swallow the trailing click / contextmenu
+  const BOX_THRESH = 4;
+
+  const boxLocalPt = (ev: MouseEvent): [number, number] => {
+    const r = container.getBoundingClientRect();
+    return [ev.clientX - r.left, ev.clientY - r.top];   // container-local == node x/y frame
+  };
+  const paintBox = (x1: number, y1: number): void => {
+    boxEl.style.left = Math.min(boxX0, x1) + "px";
+    boxEl.style.top = Math.min(boxY0, y1) + "px";
+    boxEl.style.width = Math.abs(x1 - boxX0) + "px";
+    boxEl.style.height = Math.abs(y1 - boxY0) + "px";
+  };
+  const nodesInBox = (x1: number, y1: number): string[] => {
+    const lx = Math.min(boxX0, x1), hx = Math.max(boxX0, x1);
+    const ly = Math.min(boxY0, y1), hy = Math.max(boxY0, y1);
+    const hits: string[] = [];
+    nodes.forEach((ln, id) => {
+      if (!included(id) || ln.el.style.display === "none") return;
+      if (ln.x < hx && ln.x + ln.width > lx && ln.y < hy && ln.y + ln.height > ly) hits.push(id);
+    });
+    return hits;
+  };
+
+  function boxAddToSelection(hits: string[]): void {
+    let changed = false;
+    hits.forEach(id => {
+      if (selectedIds.includes(id) || blockedSet.has(id) || prospectiveBlocked(id)) return;
+      selectedIds = [...selectedIds, id]; changed = true;
+    });
+    if (!changed) return;
+    mode = "nodes"; subBuffer = "";
+    refresh(); reveal();
+  }
+  // Edit-mode sweep: add every hit to `letter`'s bank without ever toggling an
+  // existing member out, under the same cross-bank / cycle guards a single
+  // click uses, then re-run any now-possible A->S / S->D wiring.
+  function boxAddToBank(letter: BankLetter, hits: string[]): void {
+    if (bankDisabled(letter)) return;
+    const cur = bankOf(letter);
+    const next = cur ? new Set(cur) : new Set<string>();
+    let changed = false;
+    hits.forEach(id => {
+      if (next.has(id)) return;
+      const clash = (["A", "D", "S"] as BankLetter[]).some(l => l !== letter && bankOf(l)?.has(id));
+      if (clash || wouldCreateCycle(letter, [id])) return;
+      next.add(id); changed = true;
+    });
+    if (!changed) return;
+    if (letter === "A") bankA = next;
+    else if (letter === "D") bankD = next;
+    else bankS = next;
+    paintBankBadges();
+    applyEditWiring();
+    refresh();
+  }
+  function finishBox(ev: MouseEvent): void {
+    const [x1, y1] = boxLocalPt(ev);
+    const hits = nodesInBox(x1, y1);
+    if (hits.length) {
+      if (selMode === "edit") {
+        boxAddToBank(boxBtn === 0 ? "A" : boxBtn === 1 ? "S" : "D", hits);
+      } else if (boxBtn === 2) {
+        deleteNodes(hits);
+      } else if (boxBtn === 0) {
+        boxAddToSelection(hits);
+      }
+    }
+    setActivePartition("dag", false);
+  }
+
+  container.addEventListener("mousedown", ev => {
+    if (!ev.shiftKey || boxBtn !== -1) return;
+    if (ev.button !== 0 && ev.button !== 1 && ev.button !== 2) return;
+    ev.preventDefault();                    // no text selection / middle-click autoscroll
+    boxBtn = ev.button;
+    boxActive = false;
+    [boxX0, boxY0] = boxLocalPt(ev);
+  });
+  window.addEventListener("mousemove", ev => {
+    if (boxBtn === -1) return;
+    const [x, y] = boxLocalPt(ev);
+    if (!boxActive) {
+      if (Math.abs(x - boxX0) < BOX_THRESH && Math.abs(y - boxY0) < BOX_THRESH) return;
+      boxActive = true;
+      boxEl.style.display = "block";
+    }
+    paintBox(x, y);
+  });
+  window.addEventListener("mouseup", ev => {
+    if (boxBtn === -1) return;
+    const wasActive = boxActive;
+    boxEl.style.display = "none";
+    if (wasActive) {
+      boxDragJustFinished = true;
+      setTimeout(() => { boxDragJustFinished = false; }, 0);
+      finishBox(ev);
+    }
+    boxBtn = -1; boxActive = false;
+  });
+  // Swallow the click / contextmenu the browser fires right after a sweep so
+  // it doesn't also land as a node toggle, an empty-space deselect, or a
+  // native context menu.
+  document.addEventListener("click", ev => {
+    if (boxDragJustFinished) { ev.preventDefault(); ev.stopPropagation(); }
+  }, true);
+  document.addEventListener("contextmenu", ev => {
+    if (boxDragJustFinished || boxActive) { ev.preventDefault(); ev.stopPropagation(); }
+  }, true);
 
   // ---- Keyboard focus partitions ---------------------------------------------
   // Three coarse regions share the keyboard: the DAG view, the icon bar, and
@@ -1924,6 +2147,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
     // Global: manual scroll, emphasis mode, and focus.
     if (e.altKey && k === "ArrowLeft")  { e.preventDefault(); setScroll(scrollCols - 1); return; }
     if (e.altKey && k === "ArrowRight") { e.preventDefault(); setScroll(scrollCols + 1); return; }
+    if (e.ctrlKey && k === "ArrowLeft")  { e.preventDefault(); moveBankSInto("D"); return; }
+    if (e.ctrlKey && k === "ArrowRight") { e.preventDefault(); moveBankSInto("A"); return; }
     if (k === "m" || k === "M") { e.preventDefault(); cycleSelMode(); return; }
     // Push needs an ancestry to narrow into, which edit mode has none of;
     // popping back out (staying in edit mode) is still fine.
