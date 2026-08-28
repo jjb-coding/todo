@@ -686,7 +686,7 @@ function render(container: HTMLElement, g: GraphDef): void {
       if (isDotted) {
         // Inner dotted ring via outline (outline never reflows); layers over
         // whatever ring (red/green/none) the node already has above.
-        st.outline = `${(1.5 + s).toFixed(1)}px dotted ${rgbaStr(DOTTED_COL, 0.5 + 0.4 * s)}`;
+        st.outline = `${(1.5 + s).toFixed(1)}px dashed ${rgbaStr(DOTTED_COL, 0.5 + 0.4 * s)}`;
         st.outlineOffset = `-${(3 + 2 * s).toFixed(1)}px`;
       }
     });
@@ -1497,15 +1497,19 @@ function render(container: HTMLElement, g: GraphDef): void {
   editorButtons.className = "dag-nodebox-buttons";
   const editorAddBtn = document.createElement("button");
   editorAddBtn.type = "button"; editorAddBtn.className = "dag-nodebox-btn primary";
-  editorAddBtn.textContent = "Add"; editorAddBtn.tabIndex = -1;
+  editorAddBtn.textContent = "Add";
   const editorCancelBtn = document.createElement("button");
   editorCancelBtn.type = "button"; editorCancelBtn.className = "dag-nodebox-btn";
-  editorCancelBtn.textContent = "Clear"; editorCancelBtn.tabIndex = -1;
+  editorCancelBtn.textContent = "Clear";
   editorButtons.appendChild(editorAddBtn); editorButtons.appendChild(editorCancelBtn);
   editorInner.appendChild(flagA); editorInner.appendChild(flagD);
   editorInner.appendChild(editorTitle); editorInner.appendChild(editorBody);
   editorInner.appendChild(editorHint); editorInner.appendChild(editorButtons);
-  editorBox.appendChild(editorModeIcon); editorBox.appendChild(editorInner);
+  // Shown instead of editorInner when nothing is selected and no draft is in
+  // progress — a placeholder "card" reserved for future content.
+  const editorEmptyCard = document.createElement("div");
+  editorEmptyCard.className = "dag-nodebox-empty";
+  editorBox.appendChild(editorModeIcon); editorBox.appendChild(editorInner); editorBox.appendChild(editorEmptyCard);
   panelFooter.appendChild(editorBox);
   editorAddBtn.addEventListener("click", () => { if (lastEditorMode === "existing") commitExisting(); else commitNew(); });
   editorCancelBtn.addEventListener("click", () => { if (lastEditorMode === "existing") deleteEditorTarget(); else clearEditorDraft(); });
@@ -1521,6 +1525,8 @@ function render(container: HTMLElement, g: GraphDef): void {
     editorBox.classList.toggle("mode-new", mode === "new");
     editorBox.classList.toggle("mode-existing", mode === "existing");
     editorBox.classList.toggle("mode-disabled", mode === "disabled");
+    editorInner.style.display = mode === "disabled" ? "none" : "block";
+    editorEmptyCard.style.display = mode === "disabled" ? "block" : "none";
     editorTitle.disabled = mode === "disabled";
     editorBody.disabled = mode === "disabled";
     flagA.style.display = mode === "new" ? "" : "none";
@@ -1631,34 +1637,46 @@ function render(container: HTMLElement, g: GraphDef): void {
     deleteNodes([lastEditorTarget]);
   }
 
-  // Isolated from the rest of the app's shortcuts: stopPropagation keeps every
-  // keydown that reaches here (i.e. while a field in the box has focus) from
-  // ever being seen by the global handler below.
-  editorBox.addEventListener("keydown", ev => {
-    ev.stopPropagation();
-    const k = ev.key;
-    if (k === "Tab") {
-      ev.preventDefault();
-      (document.activeElement === editorTitle ? editorBody : editorTitle).focus();
-    } else if (ev.ctrlKey && (k === "a" || k === "A")) {
-      ev.preventDefault();
+  // The pane's own keybinds — Ctrl+A/Ctrl+D/Ctrl+Enter/Esc, and Space's
+  // "focus the first input" when nothing in the pane has focus yet. Shared
+  // between two call sites: editorBox's own listener (below, for when a
+  // field actually has focus) and the global keydown handler (used when the
+  // pane is merely the *active partition*, reached via Shift+Tab, with
+  // nothing inside it focused — see "Keyboard focus partitions").
+  function handlePaneKeydown(e: KeyboardEvent): void {
+    const k = e.key;
+    if (e.ctrlKey && (k === "a" || k === "A")) {
+      e.preventDefault();
       // An empty bank can't be toggled on — instead, act as if A were pressed
       // with the DAG in focus (banks the current selection, and toggles this
       // same flag as a side effect of setBank).
       if (bankA) { editorUseA = !editorUseA; updateEditorFlags(); }
       else pressBank("A");
-    } else if (ev.ctrlKey && (k === "d" || k === "D")) {
-      ev.preventDefault();
+    } else if (e.ctrlKey && (k === "d" || k === "D")) {
+      e.preventDefault();
       if (bankD) { editorUseD = !editorUseD; updateEditorFlags(); }
       else pressBank("D");
-    } else if (ev.ctrlKey && k === "Enter") {
-      ev.preventDefault();
+    } else if (e.ctrlKey && k === "Enter") {
+      e.preventDefault();
       if (lastEditorMode === "existing") commitExisting(); else commitNew();
     } else if (k === "Escape") {
-      ev.preventDefault();
+      e.preventDefault();
       if (lastEditorMode === "existing") { selectedIds = []; mode = "idle"; refresh(); }
       else clearEditorDraft();
+    } else if (k === " " && !partitionTabbables("pane").includes(document.activeElement as HTMLElement)) {
+      e.preventDefault();
+      editorTitle.focus();
     }
+  }
+  // Isolated from the rest of the app's shortcuts: stopPropagation keeps every
+  // keydown that reaches here (i.e. while a field in the box has focus) from
+  // ever being seen by the global handler below. Plain Tab is deliberately
+  // left alone here — it's handled globally, wrapping within the pane's own
+  // tabbables (inputs, then buttons) instead of the old hardcoded two-field
+  // cycle.
+  editorBox.addEventListener("keydown", ev => {
+    ev.stopPropagation();
+    handlePaneKeydown(ev);
   });
 
   const addEdgeRaw = (from: string, to: string): void => { g.edges.push({ from, to }); };
@@ -1841,6 +1859,77 @@ function render(container: HTMLElement, g: GraphDef): void {
     });
   }
 
+  // ---- Keyboard focus partitions ---------------------------------------------
+  // Three coarse regions share the keyboard: the DAG view, the icon bar, and
+  // the node editor pane. Exactly one is "active" at a time and receives
+  // keybinds — Shift+Tab cycles between them, and is the only way to land on
+  // the icon bar; a click there deliberately leaves the active partition
+  // alone, since its buttons are meant as quick actions from wherever the
+  // user currently is, not a place to "switch into".
+  type Partition = "dag" | "icons" | "pane";
+  const PARTITION_ORDER: Partition[] = ["dag", "icons", "pane"];
+  let activePartition: Partition = "dag";
+  let partitionKeynav = false;   // reached via Shift+Tab -> a deeper blue border
+
+  const partitionEl = (p: Partition): HTMLElement =>
+    p === "dag" ? scrollEl() : p === "icons" ? bar : editorBox;
+
+  function paintPartitions(): void {
+    PARTITION_ORDER.forEach(p => {
+      const el = partitionEl(p);
+      const active = activePartition === p;
+      el.classList.toggle("dag-partition-active", active);
+      el.classList.toggle("dag-partition-keynav", active && partitionKeynav);
+    });
+  }
+  function setActivePartition(p: Partition, keynav: boolean): void {
+    activePartition = p; partitionKeynav = keynav;
+    paintPartitions();
+  }
+  // A click anywhere sets the active partition to whichever one it landed in
+  // — except the icon bar. Capturing phase, so this still runs even though
+  // node clicks (and others) call stopPropagation on the way up.
+  document.addEventListener("click", ev => {
+    const target = ev.target as Node;
+    if (editorBox.contains(target)) setActivePartition("pane", false);
+    else if (bar.contains(target)) { /* icon bar: leave the active partition as it is */ }
+    else if (scrollEl().contains(target)) setActivePartition("dag", false);
+  }, true);
+
+  // The tabbable elements of a partition, in document order — used both to
+  // wrap plain Tab within the active partition, and to know what Space
+  // should focus first when "entering" it. The DAG view has none of its own
+  // (its "entering" gesture selects rank 0 instead — see the keydown handler).
+  function partitionTabbables(p: Partition): HTMLElement[] {
+    if (p === "icons") return [modeBtn, aBtn, sBtn, dBtn, editorInd, delBtn].filter(el => !el.disabled);
+    if (p === "pane") return [editorTitle, editorBody, editorAddBtn, editorCancelBtn].filter(el => !el.disabled);
+    return [];
+  }
+  // Shift+Tab always cycles partitions, everywhere, regardless of what has
+  // focus — so it's caught in the capturing phase, ahead of anything (e.g.
+  // the pane's own keydown handler) that might otherwise stopPropagation it
+  // away. It defocuses whatever's focused (only ever meaningful for a pane
+  // input) without touching the DAG view's own selection state.
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Tab" || !e.shiftKey) return;
+    e.preventDefault();
+    (document.activeElement as HTMLElement | null)?.blur();
+    const i = PARTITION_ORDER.indexOf(activePartition);
+    setActivePartition(PARTITION_ORDER[(i + 1) % PARTITION_ORDER.length], true);
+  }, true);
+  // Plain Tab, once something in the active partition already has focus,
+  // wraps within that partition's own tabbables instead of spilling into
+  // whatever's next in the whole document.
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Tab" || e.shiftKey) return;
+    const list = partitionTabbables(activePartition);
+    if (!list.length) return;
+    const i = list.indexOf(document.activeElement as HTMLElement);
+    if (i === -1) return;   // nothing of this partition's focused yet -> let native Tab happen
+    e.preventDefault();
+    list[(i + 1) % list.length].focus();
+  }, true);
+
   // ---- Keyboard ------------------------------------------------------------
   // Holding C then pressing A/S/D centres on that bank immediately; releasing
   // C without ever having done so centres on the selection instead. Tracked
@@ -1850,6 +1939,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   document.addEventListener("keydown", e => {
     const k = e.key.toLowerCase();
     if (k === "shift") { if (!shiftHeld) { shiftHeld = true; updateCursors(); } return; }
+    if (activePartition !== "dag") return;   // hold-C-then-letter centres the DAG view; only makes sense there
     if (k === "c") { if (!heldC) { heldC = true; cComboFired = false; } return; }
     if (heldC && !e.ctrlKey && !e.altKey && !e.shiftKey && (k === "a" || k === "s" || k === "d")) {
       e.preventDefault();
@@ -1870,6 +1960,25 @@ function render(container: HTMLElement, g: GraphDef): void {
   document.addEventListener("keydown", e => {
     const k = e.key;
     if (k === "Shift" || k === "c" || k === "C") return;   // handled by the tracking listener above
+    if (k === "Tab") return;                               // handled by the dedicated listeners above
+
+    // Icon bar: nothing but "enter" it — Space, when none of its buttons
+    // have focus yet. Everything else is native button behaviour (Enter/
+    // Space activates whichever one does have focus) once it's been entered.
+    if (activePartition === "icons") {
+      if (k === " " && !partitionTabbables("icons").includes(document.activeElement as HTMLElement)) {
+        e.preventDefault();
+        modeBtn.focus();
+      }
+      return;
+    }
+    // The pane: route to its own keybinds regardless of whether one of its
+    // fields actually has focus. (If one does, this never runs at all —
+    // the pane's own listener already handled it and stopped propagation.)
+    if (activePartition === "pane") { handlePaneKeydown(e); return; }
+
+    // Everything from here on is the DAG view's own keybinds, live only
+    // while it's the active partition.
 
     // A prospective bank takes over Esc/Enter before anything else does.
     if (prospective !== null && k === "Escape") { e.preventDefault(); prospective = null; updateBar(); updateCursors(); return; }
@@ -1976,7 +2085,10 @@ function render(container: HTMLElement, g: GraphDef): void {
       else if (selectedIds.length === 1 && k === "ArrowDown") { e.preventDefault(); moveWithinRank(1); }
       return;
     }
-    // idle: only Home/End (handled above) act.
+    // idle: Home/End (handled above) act, and so does Space — the DAG
+    // view's own "entering" gesture when it's the active partition and
+    // nothing is selected yet, same destination as Home.
+    if (mode === "idle" && k === " ") { e.preventDefault(); selectRankNodes(0); return; }
   });
 
   // Click on empty space returns to the default deselected state.
@@ -1989,6 +2101,7 @@ function render(container: HTMLElement, g: GraphDef): void {
   updateBar();
   updateFocusIndicator();
   syncEditor();
+  paintPartitions();
 }
 
 // ============================================================================

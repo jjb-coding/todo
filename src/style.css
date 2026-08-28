@@ -30,6 +30,26 @@ body {
 }
 #stage { position: relative; margin: 0 auto; }
 
+/* Keyboard focus partitions: exactly one of #scroll (the DAG view),
+   .dag-statusbar (the icon bar) and .dag-nodebox (the pane) is "active" at
+   a time. Plain-active (reached by click) gets a lighter blue ring; reached
+   via Shift+Tab ("keynav") gets a deeper one. #scroll already sets its own
+   box-shadow, so its active states have to restate it alongside the ring. */
+#scroll.dag-partition-active {
+  box-shadow: 0 1px 0 #ffffff10, 0 20px 40px -20px #0008, 0 0 0 3px rgba(37,99,235,0.55) inset;
+}
+#scroll.dag-partition-active.dag-partition-keynav {
+  box-shadow: 0 1px 0 #ffffff10, 0 20px 40px -20px #0008, 0 0 0 3px rgba(29,58,180,0.95) inset;
+}
+.dag-statusbar.dag-partition-active,
+.dag-nodebox.dag-partition-active {
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.55) inset;
+}
+.dag-statusbar.dag-partition-active.dag-partition-keynav,
+.dag-nodebox.dag-partition-active.dag-partition-keynav {
+  box-shadow: 0 0 0 3px rgba(29,58,180,0.95) inset;
+}
+
 .dag-node {
   position: absolute;
   background: var(--node-bg);
@@ -220,18 +240,38 @@ body {
   position: relative;
   color: var(--node-title);
   padding: 12px;
-  border-top: 1px solid #e1e7ee;
+  border-top: 3px solid #e1e7ee;
 }
-/* Existing: black/white cross-hatch. New: green wash. Sits behind the plain
-   inset panel (.dag-nodebox-inner) that the actual form controls live on,
-   per the "inset against a plain background for clarity" requirement. */
-.dag-nodebox.mode-existing {
-  background-image: repeating-linear-gradient(45deg, #fff 0, #fff 7px, #16181c 7px, #16181c 14px);
+/* New and Existing share a green top edge — both are "the node editor",
+   just in different states. New: solid grey. Existing: the same cross-hatch
+   used to highlight a bank's nodes on hover (.dag-node.bank-hover::before),
+   reused here for visual consistency. Both sit behind the plain inset panel
+   (.dag-nodebox-inner) the actual form controls live on, per the "inset
+   against a plain background for clarity" requirement. */
+.dag-nodebox.mode-new, .dag-nodebox.mode-existing {
+  border-top-color: #2f9e44;
 }
 .dag-nodebox.mode-new {
-  background: #d9f2df;
+  background: #e4e8ed;
+}
+.dag-nodebox.mode-existing {
+  background-color: #eef1f5;
+  background-image: repeating-linear-gradient(45deg, rgba(27,39,51,0.18), rgba(27,39,51,0.18) 5px, transparent 5px, transparent 10px);
+}
+/* Nothing selected: a placeholder state, distinct from both editing states —
+   purple cross-hatch, and a different (currently empty) card in place of the
+   disabled inputs/buttons — see .dag-nodebox-empty. */
+.dag-nodebox.mode-disabled {
+  border-top-color: #9c6ade;
+  background-color: #f3ecfb;
+  background-image: repeating-linear-gradient(45deg, rgba(124,58,237,0.16), rgba(124,58,237,0.16) 5px, transparent 5px, transparent 10px);
 }
 .dag-nodebox.mode-disabled .dag-nodebox-modeicon { display: none; }
+.dag-nodebox-empty {
+  background: var(--panel);
+  border-radius: 10px;
+  min-height: 96px;
+}
 .dag-nodebox-modeicon {
   position: absolute; top: 8px; right: 10px; z-index: 1;
   min-width: 18px; height: 18px; padding: 0 4px; border-radius: 5px;
