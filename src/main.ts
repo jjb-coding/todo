@@ -268,6 +268,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
         setEdgeHover(i, true);
       });
       hit.addEventListener("mouseleave", () => { if (hoveredEdge === i) clearEdgeHover(); });
+      hit.addEventListener("click", ev => {
+        ev.stopPropagation();
+        if (!edgeTargetable(i)) return;
+        centerEdgeEndpoint(rec.from, rec.to);
+      });
       hit.addEventListener("contextmenu", ev => {
         ev.preventDefault();
         ev.stopPropagation();
@@ -706,6 +711,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (bankA && bankA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a"; badge.style.display = "block"; }
       else if (bankD && bankD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d"; badge.style.display = "block"; }
       else if (bankS && bankS.has(id)) { badge.textContent = "S"; badge.className = "dag-bank-badge s"; badge.style.display = "block"; }
+      else if (boundA && boundA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a provisional"; badge.style.display = "block"; }
+      else if (boundD && boundD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d provisional"; badge.style.display = "block"; }
       else { badge.style.display = "none"; }
     });
   }
@@ -1000,6 +1007,12 @@ function render(container: HTMLElement, initial: GraphDef): void {
 
   // One renderer for whatever mode we're in.
   function refresh(): void {
+    // A provisional A/D binding (from pressing A/D while that bank is disabled,
+    // before any New Node dialog) only survives while its selection is intact.
+    if (!editingNew) {
+      if (boundA && !setEqArr(boundA, selectedIds)) { boundA = null; paintBankBadges(); updateEditorFlags(); }
+      if (boundD && !setEqArr(boundD, selectedIds)) { boundD = null; paintBankBadges(); updateEditorFlags(); }
+    }
     if (mode === "rank") { resetFocus(); renderRank(rankSel); updateBar(); syncEditor(); return; }
     if (selMode === "edit") { applyEditFocus(); updateBar(); syncEditor(); return; }
     if (mode === "idle") { resetFocus(); updateBar(); syncEditor(); return; }
@@ -1054,7 +1067,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const delBtn = document.createElement("button");
   delBtn.className = "dag-delbtn"; delBtn.type = "button"; delBtn.textContent = "Del";
   delBtn.disabled = true;
-  delBtn.title = "Delete the selected node(s) — Delete key, or Shift+right-click a node to delete just it";
+  delBtn.title = "Delete the selected node(s) — Delete key, or right-click a node to delete just it (see setting [4] for the right-click chord)";
 
   // Grouped into: state (LR/UD/selection), mode (U-I / Focus), banks (A/S/D),
   // editing (editor toggle / delete) — each wrapped in its own bordered box.
@@ -1082,9 +1095,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
   setting2Btn.className = "dag-settingbtn"; setting2Btn.type = "button"; setting2Btn.textContent = "2";
   const setting3Btn = document.createElement("button");
   setting3Btn.className = "dag-settingbtn"; setting3Btn.type = "button"; setting3Btn.textContent = "3";
+  const setting4Btn = document.createElement("button");
+  setting4Btn.className = "dag-settingbtn"; setting4Btn.type = "button"; setting4Btn.textContent = "4";
   const groupSettings = document.createElement("div");
   groupSettings.className = "dag-bargroup";
-  groupSettings.append(setting1Btn, setting2Btn, setting3Btn);
+  groupSettings.append(setting1Btn, setting2Btn, setting3Btn, setting4Btn);
 
   bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
@@ -1141,9 +1156,27 @@ function render(container: HTMLElement, initial: GraphDef): void {
     setSettingValue("edgeConflictResolution", next);
     updateSetting3Btn();
   });
+  // [4] nodeRightClick: 2-state toggle. "P" = plain right-click deletes (default);
+  // "S" = Shift+right-click deletes, plain right-click clears the bank tag.
+  function updateSetting4Btn(): void {
+    const s = getSettings().nodeRightClick;
+    setting4Btn.style.display = s.showOnBar ? "" : "none";
+    setting4Btn.textContent = s.value === "shift-deletes" ? "S" : "P";
+    setting4Btn.classList.toggle("rc-shift-deletes", s.value === "shift-deletes");
+    setting4Btn.title = `Setting — node right-click: ${
+      s.value === "shift-deletes"
+        ? "Shift+right-click deletes, right-click clears the bank tag"
+        : "right-click deletes, Shift+right-click clears the bank tag"} (click to toggle)`;
+  }
+  setting4Btn.addEventListener("click", () => {
+    const cur = getSettings().nodeRightClick.value;
+    setSettingValue("nodeRightClick", cur === "plain-deletes" ? "shift-deletes" : "plain-deletes");
+    updateSetting4Btn();
+  });
   updateSetting1Btn();
   updateSetting2Btn();
   updateSetting3Btn();
+  updateSetting4Btn();
 
   // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
   // distinct from the coloured-drop-shadow/dotted-outline selection scheme.
@@ -1397,6 +1430,16 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const c = (Math.min(...cols) + Math.max(...cols)) / 2;
     setScrollExact(centerScrollFor(c));
   };
+  // Left-clicking an edge: bring whichever endpoint is scrolled off-screen into
+  // the centre. If both or neither is off-screen, centre the child (target).
+  const rankVisible = (r: number): boolean =>
+    r >= scrollCols && r <= scrollCols + viewportCols() - 1;
+  const centerEdgeEndpoint = (fromId: string, toId: string): void => {
+    const rf = rankMap.get(fromId), rt = rankMap.get(toId);
+    if (rf === undefined || rt === undefined) return;
+    const target = !rankVisible(rf) && rankVisible(rt) ? rf : rt;
+    setScrollExact(centerScrollFor(target));
+  };
 
   // ---- Focus: push/pop a mask, narrowing the view to a selection's ancestry -
   let focusStack: Set<string>[] = [];
@@ -1634,7 +1677,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function startNewNode(): void {
     if (!editingNew) {
       editingNew = true;
-      boundA = null; boundD = null;                 // transient captures are scoped to one dialog
+      // A disabled bank keeps any provisional binding made by pressing A/D in
+      // the DAG view (consumed here); an enabled bank starts its dialog clean.
+      if (!bankADisabled) boundA = null;
+      if (!bankDDisabled) boundD = null;
       editorUseA = !!bankA; editorUseD = !!bankD;   // default on if there's something to attach
       updateEditorFlags();
       lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
@@ -1712,8 +1758,15 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function overwriteBound(letter: "A" | "D"): void {
     if (!selectedIds.length) {
       if (letter === "A") boundA = null; else boundD = null;
-    } else if (!otherBanksConflict(letter, selectedIds) && !wouldCreateCycle(letter, selectedIds)) {
-      if (letter === "A") boundA = new Set(selectedIds); else boundD = new Set(selectedIds);
+    } else {
+      // A real bank blocks a node that's already in another bank; the hidden
+      // boundA/boundD pair has no such guard of its own, so enforce it here —
+      // a node can't be bound as both a parent and a child (that's a cycle).
+      const other = letter === "A" ? boundD : boundA;
+      const dualMember = !!other && selectedIds.some(id => other.has(id));
+      if (!dualMember && !otherBanksConflict(letter, selectedIds) && !wouldCreateCycle(letter, selectedIds)) {
+        if (letter === "A") boundA = new Set(selectedIds); else boundD = new Set(selectedIds);
+      }
     }
     updateEditorFlags();
   }
@@ -1981,7 +2034,9 @@ function render(container: HTMLElement, initial: GraphDef): void {
     ln.el.addEventListener("contextmenu", ev => {
       ev.preventDefault();
       if (selMode === "edit") { editBankClick("D", id, ev.shiftKey); return; }
-      if (ev.shiftKey) { deleteNodes([id]); return; }
+      // Setting [4] decides which chord deletes vs. clears the bank tag.
+      const deletes = ev.shiftKey === (getSettings().nodeRightClick.value === "shift-deletes");
+      if (deletes) { deleteNodes([id]); return; }
       if (removeFromBanks(id)) { paintBankBadges(); updateBar(); }
     });
   }
@@ -2381,6 +2436,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (e.ctrlKey) { if (bankA) { ensureBankS(); wireBankToS("A", e.shiftKey); } }
       else if (e.altKey) clearBankA();
       else if (e.shiftKey) toggleBankMembership("A", selectedIds);
+      else if (bankADisabled) { overwriteBound("A"); paintBankBadges(); }   // provisional binding for the next W
       else pressBank("A");
       return;
     }
@@ -2389,6 +2445,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (e.ctrlKey) { if (bankD) { ensureBankS(); wireBankToS("D", e.shiftKey); } }  // D empty -> nothing (see Ctrl+A)
       else if (e.altKey) clearBankD();
       else if (e.shiftKey) toggleBankMembership("D", selectedIds);
+      else if (bankDDisabled) { overwriteBound("D"); paintBankBadges(); }   // provisional binding for the next W
       else pressBank("D");
       return;
     }

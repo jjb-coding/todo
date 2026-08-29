@@ -23,6 +23,11 @@ export type FollowMode = "center" | "keep-in-view" | "none";
 // bank to restore consistency.
 export type EdgeConflictMode = "block" | "remove-parent" | "remove-child";
 
+// [4]: which right-click on a node deletes it. "plain-deletes" (default): a
+// bare right-click deletes, Shift+right-click clears the node's bank tag.
+// "shift-deletes": the reverse.
+export type NodeRightClick = "plain-deletes" | "shift-deletes";
+
 export interface Setting<T> {
   value: T;
   readonly canShowOnBar: boolean;   // immutable: is this setting even eligible for the icon bar?
@@ -41,6 +46,8 @@ export interface Settings {
   followSelection: Setting<FollowMode>;
   // [3], see EdgeConflictMode above.
   edgeConflictResolution: Setting<EdgeConflictMode>;
+  // [4], see NodeRightClick above.
+  nodeRightClick: Setting<NodeRightClick>;
   // Whether banks A/S/D start disabled. Startup-only — not something a live
   // icon toggle would make sense for.
   bankADisabledByDefault: Setting<boolean>;
@@ -54,6 +61,7 @@ const settings: Settings = {
   selectAndCenterOnCreate: setting(false, true, true),
   followSelection: setting<FollowMode>("keep-in-view", true, true),
   edgeConflictResolution: setting<EdgeConflictMode>("block", true, true),
+  nodeRightClick: setting<NodeRightClick>("plain-deletes", true, true),
   bankADisabledByDefault: setting(false, false, false),
   bankSDisabledByDefault: setting(false, false, false),
   bankDDisabledByDefault: setting(false, false, false),

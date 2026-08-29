@@ -239,6 +239,8 @@ body {
 .dag-bank-badge.a { color: rgb(38, 126, 54); }
 .dag-bank-badge.d { color: rgb(179, 39, 39); }
 .dag-bank-badge.s { color: rgb(37, 99, 210); }
+/* A provisional A/D binding (bank disabled): dashed outline, dimmed. */
+.dag-bank-badge.provisional { opacity: .6; outline: 1px dashed currentColor; outline-offset: -1px; }
 
 .dag-nodebox {
   order: 3;
@@ -360,6 +362,8 @@ body {
    borrow the amber / teal used elsewhere for parent / child accents. */
 .dag-statusbar .dag-settingbtn.edge-remove-parent { background: #b7791f; border-color: #d9a441; color: #1b1200; }
 .dag-statusbar .dag-settingbtn.edge-remove-child { background: #0d9488; border-color: #0a756c; color: #eafffb; }
+/* [4] node right-click: default "P" (plain deletes) is the resting grey; "S" is lit. */
+.dag-statusbar .dag-settingbtn.rc-shift-deletes { background: #2563eb; border-color: #1d4fc4; color: #eef4ff; }
 
 /* Shift-drag selection rectangle — a transient overlay, never affects layout. */
 .dag-boxsel {
