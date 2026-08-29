@@ -365,6 +365,21 @@ body {
 /* [4] node right-click: default "P" (plain deletes) is the resting grey; "S" is lit. */
 .dag-statusbar .dag-settingbtn.rc-shift-deletes { background: #2563eb; border-color: #1d4fc4; color: #eef4ff; }
 
+/* Right-click menu on a setting icon: pick a state directly. */
+.dag-setting-menu {
+  position: fixed; z-index: 100;
+  background: #fff; border: 1px solid var(--node-border); border-radius: 8px;
+  box-shadow: 0 10px 28px -10px #0007; padding: 4px; min-width: 180px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.dag-setting-menu-item {
+  text-align: left; border: 0; background: transparent; cursor: pointer;
+  font-family: inherit; font-size: 12px; color: var(--node-title);
+  padding: 6px 8px; border-radius: 5px; white-space: nowrap;
+}
+.dag-setting-menu-item:hover { background: var(--col-a); }
+.dag-setting-menu-item.current { font-weight: 700; background: #eef4ff; }
+
 /* Shift-drag selection rectangle — a transient overlay, never affects layout. */
 .dag-boxsel {
   position: absolute; z-index: 30; pointer-events: none;

@@ -23,77 +23,31 @@ import {
   COL_W, H_PAD, NODE_W, MARGIN, LABEL_BAND,
 } from "./layout";
 import type { NodeSize } from "./layout";
-import { getSettings, setSettingValue } from "./settings";
-import type { FollowMode, EdgeConflictMode } from "./settings";
+import { getSettings } from "./settings";
+import { rgbStr, lerpCol, tintCol, NEUTRAL_COL } from "./colors";
+import { createNodeView } from "./views/node_view";
+import type { NodeView } from "./views/node_view";
+import { createSettingsGroup } from "./views/settings_group";
+import { createLrIconView } from "./views/lr_icon_view";
+import { createUdIconView } from "./views/ud_icon_view";
+import { createSelIndicatorView } from "./views/sel_indicator_view";
+import type { SelKind } from "./views/sel_indicator_view";
+import { createFocusIndicatorView } from "./views/focus_indicator_view";
 
 interface LaidNode {
   def: NodeDef;
+  view: NodeView;
   rank: number;
   orderInRank: number;
-  el: HTMLDivElement;
+  el: HTMLDivElement;   // === view.el, kept so pointer listeners can be wired directly
   width: number;
-  height: number;   // measured from content
-  x: number;        // absolute top-left
+  height: number;       // measured from content
+  x: number;            // absolute top-left
   y: number;
 }
 
 const PALETTE = ["#2563eb", "#e07b1a", "#0d9488", "#7c3aed"]; // blue, orange, teal, violet (kept clear of the semantic red/green rings)
-
-// ---- Selection / hover styling --------------------------------------------
 const HOVER = 0.42;                                    // hover effect strength (0..1)
-const DROP = "0 1px 2px #1b273312, 0 6px 14px -10px #1b273340"; // default node shadow
-const HL = { yellow: [245, 179, 1], green: [47, 158, 68], red: [224, 49, 49] };
-const DOTTED_COL = [120, 128, 138]; // neutral grey for the "frontier" outline
-const NEUTRAL_COL = [[238, 242, 247], [231, 236, 243]]; // even, odd column bg
-function tintCol(region: "anc" | "self" | "desc", parity: number): number[] {
-  if (region === "anc")  return parity ? [214, 236, 223] : [224, 242, 231];
-  if (region === "self") return parity ? [241, 234, 201] : [247, 241, 214];
-  return parity ? [242, 222, 222] : [248, 231, 231];
-}
-const lerpCol = (a: number[], b: number[], t: number) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
-const rgbStr  = (c: number[]) => `rgb(${c[0]},${c[1]},${c[2]})`;
-const rgbaStr = (c: number[], a: number) => `rgba(${c[0]},${c[1]},${c[2]},${a.toFixed(3)})`;
-const ringShadow = (color: string, w: number, glow: number) =>
-  `0 0 0 ${w.toFixed(1)}px ${color}` +
-  (glow > 0 ? `, 0 0 ${(10 * glow).toFixed(1)}px ${rgbaStr(HL.yellow, 0.3 * glow)}` : "") +
-  `, ${DROP}`;
-const darker = (c: number[]) => c.map(v => Math.round(v * 0.82));
-
-// A unary tally (marks grouped in fives, the fifth a diagonal) rendered as tiny SVG.
-function tallySvg(n: number, color: string): string {
-  const H = 13, m = 4, gg = 5;
-  const marks: string[] = [];
-  let x = 1, c = n;
-  while (c > 0) {
-    const k = Math.min(5, c), gs = x, bars = Math.min(k, 4);
-    for (let i = 0; i < bars; i++) {
-      marks.push(`<line x1="${x}" y1="1" x2="${x}" y2="${H - 1}"/>`);
-      if (i < bars - 1) x += m;
-    }
-    if (k === 5) marks.push(`<line x1="${gs - 2}" y1="${H - 1}" x2="${x + 2}" y2="1"/>`);
-    x += m + gg; c -= k;
-  }
-  const w = Math.max(3, x - gg);
-  return `<svg width="${w}" height="${H}" viewBox="0 0 ${w} ${H}" fill="none" stroke="${color}" ` +
-         `stroke-width="1.6" stroke-linecap="round">${marks.join("")}</svg>`;
-}
-
-// ---- Node element (HTML so the browser sizes it from content) --------------
-function makeNodeEl(def: NodeDef): HTMLDivElement {
-  const el = document.createElement("div");
-  el.className = "dag-node";
-  const title = document.createElement("div");
-  title.className = "dag-node-title";
-  title.textContent = def.title;
-  el.appendChild(title);
-  if (def.body) {
-    const body = document.createElement("div");
-    body.className = "dag-node-body";
-    body.textContent = def.body;
-    el.appendChild(body);
-  }
-  return el;
-}
 
 // ============================================================================
 //  Layout + render
@@ -286,42 +240,19 @@ function render(container: HTMLElement, initial: GraphDef): void {
   }
   rebuildEdgeRecs();
 
-  // --- Node cards: build + MEASURE their content-driven heights --------------
-  // Each node also gets a lineage tally (top-right, inside), an enumeration
-  // digit (top-right, outside), and a bank badge (bottom-right, inside) — all
-  // absolutely positioned so toggling them never reflows anything. addNodeCard
-  // is reused later (addNode) to bring a freshly-created node into being.
+  // --- Node cards. Each node's DOM (card, lineage tally, enumeration digit,
+  // bank badge) and every visual attribute lives in views/node_view.ts; this
+  // file only ever decides *what* state a node is in and drives it in through
+  // the NodeView. addNodeCard is reused later (addNode) for fresh nodes.
   const nodes = new Map<string, LaidNode>();
-  const nodeTally = new Map<string, HTMLDivElement>();
-  const nodeEnum = new Map<string, HTMLDivElement>();
-  const nodeBank = new Map<string, HTMLDivElement>();
 
   function addNodeCard(def: NodeDef): LaidNode {
-    const el = makeNodeEl(def);
-    el.style.width = NODE_W + "px";
-    el.style.left = "-9999px"; el.style.top = "0"; el.style.visibility = "hidden";
-    container.appendChild(el);   // .dag-node is already position:absolute; measure off-screen
-    const height = el.offsetHeight;
-    el.style.visibility = "visible"; el.style.cursor = "pointer";
-
-    const ln: LaidNode = { def, rank: 0, orderInRank: 0, el, width: NODE_W, height, x: 0, y: 0 };
+    const view = createNodeView(def, container, NODE_W);
+    const ln: LaidNode = {
+      def, view, el: view.el, rank: 0, orderInRank: 0,
+      width: NODE_W, height: view.measure(), x: 0, y: 0,
+    };
     nodes.set(def.id, ln);
-
-    const tally = document.createElement("div");
-    tally.className = "dag-tally";
-    el.appendChild(tally);
-    nodeTally.set(def.id, tally);
-
-    const bank = document.createElement("div");
-    bank.className = "dag-bank-badge";
-    el.appendChild(bank);
-    nodeBank.set(def.id, bank);
-
-    const en = document.createElement("div");
-    en.className = "dag-enum";
-    container.appendChild(en);
-    nodeEnum.set(def.id, en);
-
     wireNode(ln);
     return ln;
   }
@@ -376,13 +307,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const includedSet = new Set(inducedNodes.map(n => n.id));
     nodes.forEach((ln, id) => {
       if (includedSet.has(id)) {
-        ln.el.style.display = "";
-        ln.el.style.left = ln.x + "px";
-        ln.el.style.top = ln.y + "px";
+        ln.view.show(true);
+        ln.view.moveTo(ln.x, ln.y);
       } else {
-        ln.el.style.display = "none";
-        nodeEnum.get(id)!.style.display = "none";
-        nodeTally.get(id)!.style.display = "none";
+        ln.view.show(false);
       }
     });
 
@@ -435,19 +363,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const updateCursors = (): void => {
     const barring = shiftHeld || prospective !== null;
     nodes.forEach(ln => {
-      const id = ln.def.id;
-      const barred = barredSet.has(id) || prospectiveBlocked(id);
-      ln.el.style.cursor = barring && barred ? "not-allowed" : "pointer";
+      const barred = barredSet.has(ln.def.id) || prospectiveBlocked(ln.def.id);
+      ln.view.setCursor(barring && barred ? "not-allowed" : "pointer");
     });
   };
 
   function resetFocus(): void {
-    nodes.forEach(ln => {
-      const s = ln.el.style;
-      s.opacity = ""; s.boxShadow = ""; s.outline = ""; s.outlineOffset = "";
-    });
-    nodeTally.forEach(t => { t.style.display = "none"; t.innerHTML = ""; });
-    nodeEnum.forEach(e => { e.style.display = "none"; });
+    nodes.forEach(ln => ln.view.reset());
     clearEdgeHover();
     activeEdges.clear();
     edgeRecs.forEach(r => { r.el.setAttribute("stroke-width", "2"); r.el.style.opacity = "1"; r.el.style.filter = ""; });
@@ -462,12 +384,6 @@ function render(container: HTMLElement, initial: GraphDef): void {
     blockedSet = new Set();
     barredSet = new Set();
     updateCursors();
-  }
-
-  function setTally(id: string, count: number, color: number[]): void {
-    const t = nodeTally.get(id)!;
-    t.innerHTML = tallySvg(count, rgbStr(darker(color)));
-    t.style.display = "block";
   }
 
   // Ancestor counts (kept-threshold Set, respecting selMode unless `forceUnion`)
@@ -538,33 +454,28 @@ function render(container: HTMLElement, initial: GraphDef): void {
     red.forEach((_v, k) => barred.add(k));
 
     nodes.forEach(ln => {
-      const id = ln.def.id, st = ln.el.style;
+      const id = ln.def.id;
       if (!included(id)) return;
       const gc = greenCount.get(id) || 0, rc = red.get(id) || 0;
       const isDotted = dotted.has(id);
       if (selSet.has(id)) {
-        st.boxShadow = ringShadow(rgbaStr(HL.yellow, 0.65 + 0.35 * s), 1.5 + 1.5 * s, s);
-        st.opacity = "1";
+        ln.view.setRing("select", s);
+        ln.view.setOpacity(1);
       } else if (green.has(id)) {                            // ancestor kept for this mode
-        st.boxShadow = ringShadow(rgbaStr(HL.green, 0.55 + 0.45 * s), 1 + 1.3 * s, 0);
-        st.opacity = "1";
-        if (committed) setTally(id, gc, HL.green);
+        ln.view.setRing("green", s);
+        ln.view.setOpacity(1);
+        if (committed) ln.view.setTally(gc, "green");
       } else if (rc >= rThresh) {                            // descendant kept for this mode
-        st.boxShadow = ringShadow(rgbaStr(HL.red, 0.55 + 0.45 * s), 1 + 1.3 * s, 0);
-        st.opacity = "1";
-        if (committed) setTally(id, rc, HL.red);
+        ln.view.setRing("red", s);
+        ln.view.setOpacity(1);
+        if (committed) ln.view.setTally(rc, "red");
       } else if (isDotted) {                                 // unrelated, but every ancestor is covered
-        st.opacity = String(1 - (1 - 0.82) * s);
+        ln.view.setOpacity(1 - (1 - 0.82) * s);
       } else {                                                // unrelated: dim by zone
         const base = ln.rank < minR ? 0.48 : ln.rank > maxR ? 0.62 : 0.30;
-        st.opacity = String(1 - (1 - base) * s);
+        ln.view.setOpacity(1 - (1 - base) * s);
       }
-      if (isDotted) {
-        // Inner dotted ring via outline (outline never reflows); layers over
-        // whatever ring (red/green/none) the node already has above.
-        st.outline = `${(1.5 + s).toFixed(1)}px dashed ${rgbaStr(DOTTED_COL, 0.5 + 0.4 * s)}`;
-        st.outlineOffset = `-${(3 + 2 * s).toFixed(1)}px`;
-      }
+      if (isDotted) ln.view.setDottedOutline(s);             // inner dashed ring, layered over any red/green ring
     });
 
     edgeRecs.forEach((r, i) => {
@@ -589,17 +500,17 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // compute a cone from, only three independent node sets.
   function applyEditFocus(): void {
     resetFocus();
-    const paint = (bank: Set<string> | null, color: number[]): void => {
+    const paint = (bank: Set<string> | null, kind: "bank-a" | "bank-d" | "bank-s"): void => {
       bank?.forEach(id => {
         if (!included(id)) return;
         const ln = nodes.get(id); if (!ln) return;
-        ln.el.style.boxShadow = ringShadow(rgbaStr(color, 0.85), 2.6, 0.4);
-        ln.el.style.opacity = "1";
+        ln.view.setRing(kind, 0);
+        ln.view.setOpacity(1);
       });
     };
-    paint(bankA, HL.green);
-    paint(bankD, HL.red);
-    paint(bankS, HL.yellow);
+    paint(bankA, "bank-a");
+    paint(bankD, "bank-d");
+    paint(bankS, "bank-s");
   }
   // M / the mode button: cycle Union -> Intersection -> Edit -> Union. Banks
   // A/S/D are shared state either way (Edit mode just populates them by
@@ -647,13 +558,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // Right-click on S deactivates it: emptied, and the Ctrl+A/Ctrl+D wiring
   // actions fall back to using the current selection directly instead of S.
   // Starting state comes from settings.ts (bank{A,S,D}DisabledByDefault).
-  let bankSDisabled = getSettings().bankSDisabledByDefault.value;
+  let bankSDisabled = getSettings().bankSDisabledByDefault.value === "on";
   // Right-click on A/D deactivates them the same way — emptied, no
   // Prospective Mode, bare A/D presses do nothing. Unlike S, though, A/D
   // still have a job while disabled: attaching to a new node being created
   // (see boundA/boundD below).
-  let bankADisabled = getSettings().bankADisabledByDefault.value;
-  let bankDDisabled = getSettings().bankDDisabledByDefault.value;
+  let bankADisabled = getSettings().bankADisabledByDefault.value === "on";
+  let bankDDisabled = getSettings().bankDDisabledByDefault.value === "on";
   // Remembers bankXDisabled across a trip through Edit mode (where all three
   // are always forced off) — see cycleSelMode.
   let bankSDisabledBeforeEdit = false;
@@ -706,14 +617,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
     return otherBanksConflict(prospective, [id]) || wouldCreateCycle(prospective, [id]);
   }
   function paintBankBadges(): void {
-    nodes.forEach((_ln, id) => {
-      const badge = nodeBank.get(id)!;
-      if (bankA && bankA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a"; badge.style.display = "block"; }
-      else if (bankD && bankD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d"; badge.style.display = "block"; }
-      else if (bankS && bankS.has(id)) { badge.textContent = "S"; badge.className = "dag-bank-badge s"; badge.style.display = "block"; }
-      else if (boundA && boundA.has(id)) { badge.textContent = "A"; badge.className = "dag-bank-badge a provisional"; badge.style.display = "block"; }
-      else if (boundD && boundD.has(id)) { badge.textContent = "D"; badge.className = "dag-bank-badge d provisional"; badge.style.display = "block"; }
-      else { badge.style.display = "none"; }
+    nodes.forEach((ln, id) => {
+      if (bankA && bankA.has(id)) ln.view.setBadge("A", false);
+      else if (bankD && bankD.has(id)) ln.view.setBadge("D", false);
+      else if (bankS && bankS.has(id)) ln.view.setBadge("S", false);
+      else if (boundA && boundA.has(id)) ln.view.setBadge("A", true);
+      else if (boundD && boundD.has(id)) ln.view.setBadge("D", true);
+      else ln.view.hideBadge();
     });
   }
   // A bank's icon can be mid-hover (cross-hatch applied to its members) at
@@ -722,7 +632,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // its members would otherwise be stuck cross-hatched forever. Every path
   // that empties a bank strips it first.
   const stripBankHover = (bank: Set<string> | null): void => {
-    bank?.forEach(id => nodes.get(id)?.el.classList.remove("bank-hover"));
+    bank?.forEach(id => nodes.get(id)?.view.setBankHover(false));
   };
   // Clearing A/D also switches off the editor's matching toggle, if it was
   // on, and drops any pending disabled-mode attach set (boundA/boundD) —
@@ -966,12 +876,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const { order, labels } = computeEnum();
     const w = String(order.length).length;
     order.forEach(id => {
-      const ln = nodes.get(id)!, e = nodeEnum.get(id)!;
-      e.textContent = labels.get(id)!;
-      e.style.left = (ln.x + NODE_W - w * 6.5) + "px";   // top-right, just outside the box
-      e.style.top = (ln.y - 14) + "px";
-      e.style.opacity = ".55"; e.style.color = "#5b6b7a";
-      e.style.display = "block";
+      const ln = nodes.get(id)!;
+      ln.view.showEnum(labels.get(id)!, ln.x + NODE_W - w * 6.5, ln.y - 14);   // top-right, just outside the box
     });
   }
 
@@ -979,14 +885,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const { labels } = computeEnum();
     selectedIds.forEach(id => {
       const cand = subBuffer === "" || labels.get(id)!.startsWith(subBuffer);
-      const ln = nodes.get(id)!, e = nodeEnum.get(id)!;
+      const ln = nodes.get(id)!;
       if (cand) {
-        ln.el.style.outline = "2.5px dashed rgba(18,26,38,0.9)";   // dotted sub-selection border
-        ln.el.style.outlineOffset = "-5px";
-        e.style.opacity = "1"; e.style.color = "#0f1720";
+        ln.view.setSubselectOutline();
+        ln.view.styleEnum(true);
       } else {
-        ln.el.style.opacity = "0.3";
-        e.style.opacity = "0.25";
+        ln.view.setOpacity(0.3);
+        ln.view.styleEnum(false);
       }
     });
   }
@@ -1031,27 +936,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const modeBtn = document.createElement("button");
   modeBtn.className = "dag-modebtn"; modeBtn.type = "button";
   modeBtn.title = "Selection mode — Union / Intersection / Edit (click, or press M to cycle)";
-  const selInd = document.createElement("div");
-  selInd.className = "dag-selind";
-  selInd.title = "Selection: ∅ none · R rank · S single node · C nodes in one rank · M nodes across ranks";
-  const lrInd = document.createElement("div");
-  lrInd.className = "dag-navind";
-  lrInd.textContent = "LR";
-  lrInd.title = "Left/Right arrows — active when they'd change rank";
-  const udInd = document.createElement("div");
-  udInd.className = "dag-navind";
-  udInd.textContent = "UD";
-  udInd.title = "Up/Down arrows — active when they'd move within a rank";
-  const focusInd = document.createElement("div");
-  focusInd.className = "dag-focusind";
-  focusInd.title = "Focus — F narrows to the selection's ancestry, Shift+F pops back out";
-  const focusLetter = document.createElement("span");
-  focusLetter.textContent = "F";
-  const focusDepthEl = document.createElement("span");
-  focusDepthEl.className = "dag-focus-depth";
-  focusDepthEl.textContent = "0";
-  focusInd.appendChild(focusLetter);
-  focusInd.appendChild(focusDepthEl);
+  const selIcon = createSelIndicatorView();
+  const lrIcon = createLrIconView();
+  const udIcon = createUdIconView();
+  const focusIcon = createFocusIndicatorView();
   const aBtn = document.createElement("button");
   aBtn.className = "dag-bankbtn a"; aBtn.type = "button"; aBtn.textContent = "A";
   aBtn.title = "Bank A — A banks/arms, Shift+A toggles membership, Alt+A clears, Ctrl+A/Ctrl+Shift+A wire it onto S as parents, right-click disables (Ctrl+A in the editor then binds the selection directly, without banking it), hold C then A to centre on it";
@@ -1073,33 +961,21 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // editing (editor toggle / delete) — each wrapped in its own bordered box.
   const groupState = document.createElement("div");
   groupState.className = "dag-bargroup";
-  groupState.append(lrInd, udInd, selInd);
+  groupState.append(lrIcon.el, udIcon.el, selIcon.el);
   const groupMode = document.createElement("div");
   groupMode.className = "dag-bargroup";
-  groupMode.append(modeBtn, focusInd);
+  groupMode.append(modeBtn, focusIcon.el);
   const groupBanks = document.createElement("div");
   groupBanks.className = "dag-bargroup";
   groupBanks.append(aBtn, sBtn, dBtn);
-  groupBanks.style.display = getSettings().banksHiddenByDefault.value ? "none" : "";
+  groupBanks.style.display = getSettings().banksHiddenByDefault.value === "on" ? "none" : "";
   const groupEditing = document.createElement("div");
   groupEditing.className = "dag-bargroup";
   groupEditing.append(editorInd, delBtn);
 
-  // Settings framework: icons for [1]/[2] only (the rest aren't the sort of
-  // thing a live icon toggle would make sense for — see settings.ts). A
-  // settings modal to bring other settings into the bar, or take these back
-  // out, comes later; showOnBar just decides whether the icon exists at all.
-  const setting1Btn = document.createElement("button");
-  setting1Btn.className = "dag-settingbtn"; setting1Btn.type = "button"; setting1Btn.textContent = "1";
-  const setting2Btn = document.createElement("button");
-  setting2Btn.className = "dag-settingbtn"; setting2Btn.type = "button"; setting2Btn.textContent = "2";
-  const setting3Btn = document.createElement("button");
-  setting3Btn.className = "dag-settingbtn"; setting3Btn.type = "button"; setting3Btn.textContent = "3";
-  const setting4Btn = document.createElement("button");
-  setting4Btn.className = "dag-settingbtn"; setting4Btn.type = "button"; setting4Btn.textContent = "4";
-  const groupSettings = document.createElement("div");
-  groupSettings.className = "dag-bargroup";
-  groupSettings.append(setting1Btn, setting2Btn, setting3Btn, setting4Btn);
+  // The settings icons + their click-cycle and right-click menus live entirely
+  // in views/settings_group.ts, keyed off each setting's category.
+  const groupSettings = createSettingsGroup("dag_view").el;
 
   bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
@@ -1113,76 +989,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
   editorInd.addEventListener("click", () => startNewNode());
   delBtn.addEventListener("click", () => deleteNodes(selectedIds));
 
-  // [1] selectAndCenterOnCreate: plain boolean toggle.
-  function updateSetting1Btn(): void {
-    const s = getSettings().selectAndCenterOnCreate;
-    setting1Btn.style.display = s.showOnBar ? "" : "none";
-    setting1Btn.classList.toggle("on", s.value);
-    setting1Btn.title = `Setting — select & centre on a new node when it's created: currently ${s.value ? "on" : "off"} (click to toggle)`;
-  }
-  setting1Btn.addEventListener("click", () => {
-    setSettingValue("selectAndCenterOnCreate", !getSettings().selectAndCenterOnCreate.value);
-    updateSetting1Btn();
-  });
-  // [2] followSelection: 3-state cycle, keep-in-view -> center -> none.
-  function updateSetting2Btn(): void {
-    const s = getSettings().followSelection;
-    setting2Btn.style.display = s.showOnBar ? "" : "none";
-    setting2Btn.classList.toggle("follow-center", s.value === "center");
-    setting2Btn.classList.toggle("follow-none", s.value === "none");
-    setting2Btn.title = `Setting — Left/Right follow mode: currently "${s.value}" (click to cycle keep-in-view / center / none)`;
-  }
-  setting2Btn.addEventListener("click", () => {
-    const cur = getSettings().followSelection.value;
-    const next: FollowMode = cur === "keep-in-view" ? "center" : cur === "center" ? "none" : "keep-in-view";
-    setSettingValue("followSelection", next);
-    updateSetting2Btn();
-  });
-  // [3] edgeConflictResolution: 3-state cycle, block -> remove-parent -> remove-child.
-  function updateSetting3Btn(): void {
-    const s = getSettings().edgeConflictResolution;
-    setting3Btn.style.display = s.showOnBar ? "" : "none";
-    setting3Btn.textContent = s.value === "block" ? "B" : s.value === "remove-parent" ? "P" : "C";
-    setting3Btn.classList.toggle("edge-remove-parent", s.value === "remove-parent");
-    setting3Btn.classList.toggle("edge-remove-child", s.value === "remove-child");
-    setting3Btn.title = `Setting — when a drag-created edge would break A/S/D bank ordering: ${
-      s.value === "block" ? "block the edge" :
-      s.value === "remove-parent" ? "create it, dropping the offending parent from its bank" :
-      "create it, dropping the offending child from its bank"} (click to cycle)`;
-  }
-  setting3Btn.addEventListener("click", () => {
-    const cur = getSettings().edgeConflictResolution.value;
-    const next: EdgeConflictMode = cur === "block" ? "remove-parent" : cur === "remove-parent" ? "remove-child" : "block";
-    setSettingValue("edgeConflictResolution", next);
-    updateSetting3Btn();
-  });
-  // [4] nodeRightClick: 2-state toggle. "P" = plain right-click deletes (default);
-  // "S" = Shift+right-click deletes, plain right-click clears the bank tag.
-  function updateSetting4Btn(): void {
-    const s = getSettings().nodeRightClick;
-    setting4Btn.style.display = s.showOnBar ? "" : "none";
-    setting4Btn.textContent = s.value === "shift-deletes" ? "S" : "P";
-    setting4Btn.classList.toggle("rc-shift-deletes", s.value === "shift-deletes");
-    setting4Btn.title = `Setting — node right-click: ${
-      s.value === "shift-deletes"
-        ? "Shift+right-click deletes, right-click clears the bank tag"
-        : "right-click deletes, Shift+right-click clears the bank tag"} (click to toggle)`;
-  }
-  setting4Btn.addEventListener("click", () => {
-    const cur = getSettings().nodeRightClick.value;
-    setSettingValue("nodeRightClick", cur === "plain-deletes" ? "shift-deletes" : "plain-deletes");
-    updateSetting4Btn();
-  });
-  updateSetting1Btn();
-  updateSetting2Btn();
-  updateSetting3Btn();
-  updateSetting4Btn();
-
   // Hovering a filled bank's icon highlights its nodes with a cross-hatch —
   // distinct from the coloured-drop-shadow/dotted-outline selection scheme.
   const bankHover = (bank: Set<string> | null, on: boolean): void => {
     if (!bank) return;
-    bank.forEach(id => nodes.get(id)?.el.classList.toggle("bank-hover", on));
+    bank.forEach(id => nodes.get(id)?.view.setBankHover(on));
   };
   aBtn.addEventListener("mouseenter", () => bankHover(bankA, true));
   aBtn.addEventListener("mouseleave", () => bankHover(bankA, false));
@@ -1222,13 +1033,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
     modeBtn.textContent = selMode === "intersection" ? "I" : selMode === "edit" ? "E" : "U";
     modeBtn.classList.toggle("on", selMode === "intersection");
     modeBtn.classList.toggle("edit", selMode === "edit");
-    let t = "∅";
-    if (mode === "rank") t = "R";
+    let sk: SelKind = "none";
+    if (mode === "rank") sk = "rank";
     else if (selMode !== "edit" && (mode === "nodes" || mode === "subselect"))
-      t = selectedIds.length === 1 ? "S" : (singularRank() !== null ? "C" : "M");
-    selInd.textContent = t;
-    lrInd.classList.toggle("off", !lrActive());
-    udInd.classList.toggle("off", !udActive());
+      sk = selectedIds.length === 1 ? "single" : (singularRank() !== null ? "column" : "multi");
+    selIcon.set(sk);
+    lrIcon.set(lrActive());
+    udIcon.set(udActive());
     delBtn.disabled = !selectedIds.length;
 
     const editMode = selMode === "edit";
@@ -1255,8 +1066,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   }
 
   function updateFocusIndicator(): void {
-    focusDepthEl.textContent = String(focusStack.length);
-    focusInd.classList.toggle("off", focusStack.length === 0);
+    focusIcon.set(focusStack.length);
   }
 
   // ---- Manual horizontal scroll (whole-column steps) -----------------------
@@ -1700,19 +1510,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function updateNodeContent(id: string, title: string, body: string): void {
     const ln = nodes.get(id); if (!ln) return;
     updateNode(id, title, body || undefined);
-    (ln.el.querySelector(".dag-node-title") as HTMLDivElement).textContent = title;
-    let bodyEl = ln.el.querySelector(".dag-node-body") as HTMLDivElement | null;
-    if (body) {
-      if (!bodyEl) {
-        bodyEl = document.createElement("div");
-        bodyEl.className = "dag-node-body";
-        ln.el.insertBefore(bodyEl, nodeTally.get(id)!);
-      }
-      bodyEl.textContent = body;
-    } else if (bodyEl) {
-      bodyEl.remove();
-    }
-    ln.height = ln.el.offsetHeight;
+    ln.view.setContent(title, body || undefined);
+    ln.height = ln.view.measure();
     relayout();
   }
   const onEditorInput = (): void => paintEditorChrome(lastEditorMode ?? "disabled");
@@ -1879,7 +1678,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     addNodeCard(def);
     syncGraphStructure();
     paintBankBadges();
-    const selectOnCreate = getSettings().selectAndCenterOnCreate.value;
+    const selectOnCreate = getSettings().selectAndCenterOnCreate.value === "on";
     if (selectOnCreate) { selectedIds = [id]; mode = "nodes"; subBuffer = ""; }
     refresh();
     if (selectOnCreate) centerOnSelection();
@@ -1953,12 +1752,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
     if (!idSet.size) return;
     graphDeleteNodes(idSet);
     idSet.forEach(id => {
-      nodes.get(id)!.el.remove();                 // takes its tally/badge children with it
+      nodes.get(id)!.view.destroy();
       nodes.delete(id);
-      nodeEnum.get(id)?.remove();
-      nodeEnum.delete(id);
-      nodeTally.delete(id);
-      nodeBank.delete(id);
       removeFromBanks(id);
     });
     selectedIds = selectedIds.filter(id => !idSet.has(id));
@@ -2075,7 +1870,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const ly = Math.min(boxY0, y1), hy = Math.max(boxY0, y1);
     const hits: string[] = [];
     nodes.forEach((ln, id) => {
-      if (!included(id) || ln.el.style.display === "none") return;
+      if (!included(id) || !ln.view.visible) return;
       if (ln.x < hx && ln.x + ln.width > lx && ln.y < hy && ln.y + ln.height > ly) hits.push(id);
     });
     return hits;
@@ -2194,7 +1989,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const nodeAtPoint = (x: number, y: number): string | null => {
     let hit: string | null = null;
     nodes.forEach((ln, id) => {
-      if (!included(id) || ln.el.style.display === "none") return;
+      if (!included(id) || !ln.view.visible) return;
       if (x >= ln.x && x <= ln.x + ln.width && y >= ln.y && y <= ln.y + ln.height) hit = id;
     });
     return hit;
@@ -2236,7 +2031,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   const clearEdgeDrag = (): void => {
     edgeDragFrom = null; edgeDragActive = false;
     edgeDragLine.style.display = "none";
-    nodes.forEach(ln => ln.el.classList.remove("edge-drop", "edge-drop-no"));
+    nodes.forEach(ln => ln.view.setEdgeDrop(null));
   };
   window.addEventListener("mousemove", ev => {
     if (edgeDragFrom === null) return;
@@ -2255,8 +2050,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const over = nodeAtPoint(x, y);
     nodes.forEach((ln, nid) => {
       const bad = over === edgeDragFrom || hasEdge(edgeDragFrom!, over || "") || (!!over && ancOf.get(edgeDragFrom!)!.has(over));
-      ln.el.classList.toggle("edge-drop", nid === over && nid !== edgeDragFrom && !bad);
-      ln.el.classList.toggle("edge-drop-no", nid === over && (nid === edgeDragFrom || bad));
+      ln.view.setEdgeDrop(
+        nid === over && nid !== edgeDragFrom && !bad ? "ok"
+        : nid === over && (nid === edgeDragFrom || bad) ? "no"
+        : null,
+      );
     });
   });
   window.addEventListener("mouseup", ev => {

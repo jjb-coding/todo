@@ -1,84 +1,96 @@
 // ============================================================================
 //  Settings — a small store of user preferences, held privately here (same
-//  discipline as state.ts's graph). Each setting carries its value plus two
-//  independent flags: whether it's even *eligible* to appear as an icon on
-//  the status bar (canShowOnBar — fixed per setting, decided once below)
-//  and whether it currently *does* (showOnBar — mutable, meant to be
-//  flipped later by a settings modal; for now it's just the framework, so
-//  nothing here changes showOnBar itself except at startup).
-//  Values persist only for the running session; nothing is written to
-//  storage, and none of this reaches into the app to apply a change —
-//  main.ts reads these values where it needs them.
+//  discipline as state.ts's graph). Every setting's value is an enum/string
+//  (booleans included, as "on"/"off"), carries the ordered list of states it
+//  cycles through, a category (all "dag_view" for now), and either a
+//  SettingIcon strategy or null when it can never be shown as a status-bar
+//  icon. `showOnBar` (mutable, meant for a future settings modal) says whether
+//  it currently is. Values persist only for the running session; nothing here
+//  reaches into the app to apply a change — main.ts reads these where needed.
 // ============================================================================
 
-// [2]: how Left/Right (rank and node selection) scrolling follows the
-// current selection. "keep-in-view" is today's existing behaviour (nudge
-// the scroll just enough to bring it on screen); "center" always centres
-// it; "none" never auto-scrolls for it at all.
+import type { SettingIcon } from "./views/setting_icon";
+import {
+  selectOnCreateIcon, followSelectionIcon, edgeConflictIcon, nodeRightClickIcon,
+} from "./views/setting_icons";
+
+// how Left/Right scrolling follows the current selection.
 export type FollowMode = "center" | "keep-in-view" | "none";
-
-// [3]: when a drag-created edge would break the A ≺ S ≺ D bank ordering
-// (e.g. put an S node above an A node): "block" refuses the edge; the other
-// two create it anyway, dropping the offending parent / child node from its
-// bank to restore consistency.
+// when a drag-created edge would break the A ≺ S ≺ D bank ordering.
 export type EdgeConflictMode = "block" | "remove-parent" | "remove-child";
-
-// [4]: which right-click on a node deletes it. "plain-deletes" (default): a
-// bare right-click deletes, Shift+right-click clears the node's bank tag.
-// "shift-deletes": the reverse.
+// which right-click chord on a node deletes it.
 export type NodeRightClick = "plain-deletes" | "shift-deletes";
+export type OnOff = "on" | "off";
 
-export interface Setting<T> {
+export type SettingCategory = "dag_view";
+
+export interface Setting<T extends string> {
   value: T;
-  readonly canShowOnBar: boolean;   // immutable: is this setting even eligible for the icon bar?
-  showOnBar: boolean;               // mutable: is it actually shown there right now?
+  readonly states: readonly T[];       // ordered — left-click cycles through these
+  readonly category: SettingCategory;
+  readonly icon: SettingIcon | null;   // null -> can never be a status-bar icon
+  showOnBar: boolean;                   // currently shown as an icon (only meaningful when icon != null)
 }
 
-function setting<T>(value: T, canShowOnBar: boolean, showOnBar: boolean): Setting<T> {
-  return { value, canShowOnBar, showOnBar: canShowOnBar && showOnBar };
+function setting<T extends string>(
+  value: T, states: readonly T[], category: SettingCategory,
+  icon: SettingIcon | null, showOnBar: boolean,
+): Setting<T> {
+  return { value, states, category, icon, showOnBar: !!icon && showOnBar };
 }
 
 export interface Settings {
-  // [1]: upon creating a node, select and centre on it (vs. today's
-  // behaviour of leaving selection/scroll untouched).
-  selectAndCenterOnCreate: Setting<boolean>;
+  // [1]: upon creating a node, select and centre on it (vs. leaving
+  // selection/scroll untouched).
+  selectAndCenterOnCreate: Setting<OnOff>;
   // [2], see FollowMode above.
   followSelection: Setting<FollowMode>;
   // [3], see EdgeConflictMode above.
   edgeConflictResolution: Setting<EdgeConflictMode>;
   // [4], see NodeRightClick above.
   nodeRightClick: Setting<NodeRightClick>;
-  // Whether banks A/S/D start disabled. Startup-only — not something a live
-  // icon toggle would make sense for.
-  bankADisabledByDefault: Setting<boolean>;
-  bankSDisabledByDefault: Setting<boolean>;
-  bankDDisabledByDefault: Setting<boolean>;
-  // Whether the banks group on the icon bar starts hidden. Also startup-only.
-  banksHiddenByDefault: Setting<boolean>;
+  // Startup-only: whether banks A/S/D start disabled, and whether the banks
+  // icon group starts hidden. Never status-bar icons.
+  bankADisabledByDefault: Setting<OnOff>;
+  bankSDisabledByDefault: Setting<OnOff>;
+  bankDDisabledByDefault: Setting<OnOff>;
+  banksHiddenByDefault: Setting<OnOff>;
 }
 
 const settings: Settings = {
-  selectAndCenterOnCreate: setting(false, true, true),
-  followSelection: setting<FollowMode>("keep-in-view", true, true),
-  edgeConflictResolution: setting<EdgeConflictMode>("block", true, true),
-  nodeRightClick: setting<NodeRightClick>("plain-deletes", true, true),
-  bankADisabledByDefault: setting(false, false, false),
-  bankSDisabledByDefault: setting(false, false, false),
-  bankDDisabledByDefault: setting(false, false, false),
-  banksHiddenByDefault: setting(false, false, false),
+  selectAndCenterOnCreate: setting<OnOff>("off", ["off", "on"], "dag_view", selectOnCreateIcon, true),
+  followSelection: setting<FollowMode>(
+    "keep-in-view", ["keep-in-view", "center", "none"], "dag_view", followSelectionIcon, true),
+  edgeConflictResolution: setting<EdgeConflictMode>(
+    "block", ["block", "remove-parent", "remove-child"], "dag_view", edgeConflictIcon, true),
+  nodeRightClick: setting<NodeRightClick>(
+    "plain-deletes", ["plain-deletes", "shift-deletes"], "dag_view", nodeRightClickIcon, true),
+  bankADisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
+  bankSDisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
+  bankDDisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
+  banksHiddenByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
 };
 
-// The live store — callers may read any setting's fields directly
-// (settings.value / .canShowOnBar / .showOnBar) but should only ever write
-// through the functions below, so every change funnels through one place.
+// Readers may touch any setting's fields directly (settings.value / .states /
+// .icon / .showOnBar) but should only write through the functions below.
 export function getSettings(): Readonly<Settings> { return settings; }
 
 export function setSettingValue<K extends keyof Settings>(key: K, value: Settings[K]["value"]): void {
   settings[key].value = value;
 }
 
-// No-ops for a setting whose canShowOnBar is false — that flag is immutable.
 export function setShowOnBar<K extends keyof Settings>(key: K, show: boolean): void {
   const s = settings[key];
-  if (s.canShowOnBar) s.showOnBar = show;
+  if (s.icon) s.showOnBar = show;
+}
+
+// Loose helpers for the generic settings-group UI, which deals only in
+// strings and can't line up `key` with its value type at compile time.
+export function advanceSetting(key: keyof Settings): void {
+  const s = settings[key] as unknown as { value: string; states: readonly string[] };
+  const i = s.states.indexOf(s.value);
+  s.value = s.states[(i + 1) % s.states.length];
+}
+export function setSettingString(key: keyof Settings, value: string): void {
+  (settings[key] as unknown as { value: string }).value = value;
 }
