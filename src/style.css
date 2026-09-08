@@ -60,6 +60,14 @@ body {
   overflow: hidden;
   user-select: none; -webkit-user-select: none;
 }
+/* Translucent preview of the node being created (New Node editor). */
+.dag-node.dag-node-ghost {
+  opacity: 0.5;
+  border-style: dashed;
+  border-color: #2563eb;
+  box-shadow: none;
+  pointer-events: none;
+}
 .dag-node-title { font-size: 13.5px; font-weight: 650; color: var(--node-title); line-height: 1.25; }
 .dag-node-body { font-size: 12px; color: var(--node-body); line-height: 1.4; margin-top: 5px; }
 .dag-rank-label {

@@ -12,7 +12,7 @@
 //    re-lays-out and repaints the same, persistent DOM elements.
 // ============================================================================
 
-import type { NodeDef, GraphDef } from "./state";
+import type { NodeDef, EdgeDef, GraphDef } from "./state";
 import {
   initGraph, getNodes, getEdges, hasEdge, addEdge, deleteEdge,
   addNode as graphAddNode, updateNode, deleteNodes as graphDeleteNodes,
@@ -22,7 +22,7 @@ import {
   computeLayout, bezierPath, colX, edgeKey,
   COL_W, H_PAD, NODE_W, MARGIN, LABEL_BAND,
 } from "./layout";
-import type { NodeSize } from "./layout";
+import type { NodeSize, LayoutResult } from "./layout";
 import { getSettings } from "./settings";
 import { rgbStr, lerpCol, tintCol, NEUTRAL_COL } from "./colors";
 import { createNodeView } from "./views/node_view";
@@ -76,7 +76,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     `<pattern id="rankHatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
     `<rect width="7" height="7" fill="rgb(248,244,220)"/>` +
     `<line x1="0" y1="0" x2="0" y2="7" stroke="rgba(110,110,110,0.22)" stroke-width="2"/></pattern>`;
-  svg.innerHTML = "<defs>" + markers + rankHatch + "</defs>";
+  const ghostMarker =
+    `<marker id="ghost-arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="userSpaceOnUse">` +
+    `<path d="M0,0 L8,3 L0,6 Z" fill="rgba(37,99,235,0.5)"/></marker>`;
+  svg.innerHTML = "<defs>" + markers + rankHatch + ghostMarker + "</defs>";
   container.appendChild(svg);
 
   // A sticky footer, inside the same white-bordered pane as the DAG itself,
@@ -276,6 +279,21 @@ function render(container: HTMLElement, initial: GraphDef): void {
   let byRank: LaidNode[][] = [];
   let canvasW = 0, canvasH = 0;
   let scrollDomain = COL_W;
+  let lastLayout: LayoutResult | null = null;
+
+  // ---- New-node ghost — a translucent preview of the node being created.
+  // Never enters state.ts; relayout() folds it into the layout locally (only
+  // when it has assigned parents) and paints it + its own translucent edges.
+  const GHOST_ID = "__ghost__";
+  interface Ghost {
+    view: NodeView;
+    parents: string[];   // effective bank/bound A, if the editor will attach it
+    children: string[];  // effective bank/bound D
+    edgeEls: SVGElement[];
+  }
+  let ghost: Ghost | null = null;
+  const arrEqUnordered = (a: string[], b: string[]): boolean =>
+    a.length === b.length && new Set(a).size === new Set([...a, ...b]).size;
 
   // Re-run the layout algorithm (layout.ts, given each node's measured size)
   // over whichever nodes/edges are currently included, and paint the result
@@ -284,21 +302,31 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function relayout(): number {
     const inducedNodes = getNodes().filter(n => included(n.id));
     const inducedEdges = getEdges().filter(e => included(e.from) && included(e.to));
-    const induced: GraphDef = { nodes: inducedNodes, edges: inducedEdges };
+
+    // The ghost joins the layout only when it has assigned parents — then it
+    // sits at a real rank and edges snake around it like any other node.
+    const gIn = ghostLayoutInput();
+    const layoutNodes = gIn ? [...inducedNodes, { id: GHOST_ID, title: "" }] : inducedNodes;
+    const layoutEdges = gIn ? [...inducedEdges, ...gIn.edges] : inducedEdges;
+    const induced: GraphDef = { nodes: layoutNodes, edges: layoutEdges };
 
     rankMap = computeRanks(induced);
-    maxRank = inducedNodes.length ? Math.max(...inducedNodes.map(n => rankMap.get(n.id)!)) : 0;
+    maxRank = layoutNodes.length ? Math.max(...layoutNodes.map(n => rankMap.get(n.id)!)) : 0;
+    if (gIn && maxRank > maxRank0) growRankPools(maxRank);
 
     const sizes = new Map<string, NodeSize>();
     inducedNodes.forEach(def => {
       const ln = nodes.get(def.id)!;
       sizes.set(def.id, { width: ln.width, height: ln.height });
     });
+    if (gIn) sizes.set(GHOST_ID, { width: NODE_W, height: ghost!.view.measure() });
     const layout = computeLayout(induced, rankMap, maxRank, sizes);
+    lastLayout = layout;
     canvasW = layout.canvasW; canvasH = layout.canvasH; scrollDomain = layout.scrollDomain;
 
-    byRank = layout.byRank.map(ids => ids.map(id => nodes.get(id)!));
+    byRank = layout.byRank.map(ids => ids.filter(id => id !== GHOST_ID).map(id => nodes.get(id)!));
     layout.positions.forEach((pos, id) => {
+      if (id === GHOST_ID) return;
       const ln = nodes.get(id)!;
       ln.rank = pos.rank; ln.orderInRank = pos.orderInRank; ln.x = pos.x; ln.y = pos.y;
     });
@@ -345,6 +373,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     svg.setAttribute("height", String(canvasH));
 
     updateScrollbarGeometry();
+    paintGhost();
     return maxRank;
   }
 
@@ -918,6 +947,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (boundA && !setEqArr(boundA, selectedIds)) { boundA = null; paintBankBadges(); updateEditorFlags(); }
       if (boundD && !setEqArr(boundD, selectedIds)) { boundD = null; paintBankBadges(); updateEditorFlags(); }
     }
+    updateGhost();   // keep the new-node preview in sync with editor + bank state
     if (mode === "rank") { resetFocus(); renderRank(rankSel); updateBar(); syncEditor(); return; }
     if (selMode === "edit") { applyEditFocus(); updateBar(); syncEditor(); return; }
     if (mode === "idle") { resetFocus(); updateBar(); syncEditor(); return; }
@@ -975,7 +1005,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
 
   // The settings icons + their click-cycle and right-click menus live entirely
   // in views/settings_group.ts, keyed off each setting's category.
-  const groupSettings = createSettingsGroup("dag_view").el;
+  const groupSettings = createSettingsGroup("dag_view", () => updateGhost()).el;
 
   bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
@@ -1160,6 +1190,12 @@ function render(container: HTMLElement, initial: GraphDef): void {
     container.style.transform = `translateX(${-scrollCols * COL_W}px)`;
     paintScrollbar(scrollCols);
     paintCurrentNotch();
+    // The free-floating ghost is anchored to the viewport centre, so it tracks
+    // horizontal scroll; the parent-/child-anchored variants don't move.
+    if (ghost && !ghost.parents.length && !ghost.children.length) {
+      const h = ghost.view.measure();
+      ghost.view.moveTo(scrollCols * COL_W + viewportPx() / 2 - NODE_W / 2, (canvasH - MARGIN + 6) - h / 2);
+    }
   };
   const setScroll = (c: number): void => { scrollCols = clampScroll(c); applyScroll(); };
   // Like setScroll, but keeps the fractional part — needed so "centre on rank c"
@@ -1496,6 +1532,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
       syncEditor();
     }
+    updateGhost();
     editorTitle.focus();
   }
   function clearEditorDraft(): void {
@@ -1505,6 +1542,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     editorUseA = false; editorUseD = false; updateEditorFlags();
     lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync even if mode/target don't change
     syncEditor();
+    updateGhost();
   }
   // Apply title/body edits onto the node actually being edited.
   function updateNodeContent(id: string, title: string, body: string): void {
@@ -1514,7 +1552,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     ln.height = ln.view.measure();
     relayout();
   }
-  const onEditorInput = (): void => paintEditorChrome(lastEditorMode ?? "disabled");
+  const onEditorInput = (): void => { paintEditorChrome(lastEditorMode ?? "disabled"); updateGhost(); };
   editorTitle.addEventListener("input", onEditorInput);
   editorBody.addEventListener("input", onEditorInput);
   function commitNew(): void {
@@ -1526,6 +1564,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
     editorUseA = false; editorUseD = false; updateEditorFlags();
     lastEditorMode = undefined; lastEditorTarget = undefined;   // force a resync
     syncEditor();
+    updateGhost();   // dialog closed -> ghost gone, reflow without it
   }
   function commitExisting(): void {
     if (lastEditorMode !== "existing" || !lastEditorTarget) return;
@@ -1540,6 +1579,121 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function deleteEditorTarget(): void {
     if (lastEditorMode !== "existing" || !lastEditorTarget) return;
     deleteNodes([lastEditorTarget]);
+  }
+
+  // ---- New-node ghost --------------------------------------------------------
+  // Effective parent / child sets for the node being drafted — the same banks
+  // (or hidden bound sets) the editor would wire on commit.
+  function ghostParentsChildren(): { parents: string[]; children: string[] } {
+    const pSrc = attachA() ? (bankADisabled ? boundA : bankA) : null;
+    const cSrc = attachD() ? (bankDDisabled ? boundD : bankD) : null;
+    const keep = (id: string): boolean => nodes.has(id) && included(id);
+    const parents = pSrc ? Array.from(pSrc).filter(keep) : [];
+    const children = cSrc ? Array.from(cSrc).filter(keep) : [];
+    const cyclic = parents.some(p => children.some(c => p === c || ancOf.get(p)?.has(c)));
+    return cyclic ? { parents: [], children: [] } : { parents, children };
+  }
+  // The ghost's edges to fold into the layout — only when it has assigned
+  // parents (then it lands at a real rank and the graph flows around it).
+  // Stale ids are filtered so a mid-edit deletion can't break computeRanks.
+  function ghostLayoutInput(): { edges: EdgeDef[] } | null {
+    if (!ghost) return null;
+    const parents = ghost.parents.filter(id => nodes.has(id) && included(id));
+    if (!parents.length) return null;
+    const children = ghost.children.filter(id => nodes.has(id) && included(id));
+    return {
+      edges: [
+        ...parents.map(p => ({ from: p, to: GHOST_ID })),
+        ...children.map(c => ({ from: GHOST_ID, to: c })),
+      ],
+    };
+  }
+  // Position the ghost + (re)draw its translucent edges. Runs at the end of
+  // every relayout.
+  function paintGhost(): void {
+    if (!ghost) return;
+    const h = ghost.view.measure();
+    const anchors: [number, number][][] = [];
+    let gx: number, gy: number;
+
+    const layoutParents = ghost.parents.filter(id => nodes.has(id) && included(id));
+    if (layoutParents.length && lastLayout) {
+      const pos = lastLayout.positions.get(GHOST_ID);
+      if (!pos) { ghost.view.show(false); paintGhostEdges([]); return; }
+      gx = pos.x; gy = pos.y;
+      const push = (a?: [number, number][]) => { if (a) anchors.push(a); };
+      layoutParents.forEach(p => push(lastLayout!.edgeAnchors.get(edgeKey({ from: p, to: GHOST_ID }))));
+      ghost.children.filter(id => nodes.has(id) && included(id))
+        .forEach(c => push(lastLayout!.edgeAnchors.get(edgeKey({ from: GHOST_ID, to: c }))));
+    } else {
+      gy = (canvasH - MARGIN + 6) - h / 2;   // centred on the bottom edge of the column band
+      const kids = ghost.children.filter(id => nodes.has(id) && included(id));
+      if (kids.length) {
+        const targetRank = Math.max(0, Math.min(...kids.map(c => nodes.get(c)!.rank)) - 1);
+        gx = colX(targetRank) + H_PAD;
+        kids.forEach(c => {
+          const ln = nodes.get(c)!;
+          anchors.push([[gx + NODE_W, gy + h / 2], [ln.x, ln.y + ln.height / 2]]);
+        });
+      } else {
+        gx = scrollCols * COL_W + viewportPx() / 2 - NODE_W / 2;   // viewport centre
+      }
+    }
+    ghost.view.moveTo(gx, gy);
+    ghost.view.show(true);
+    paintGhostEdges(anchors);
+  }
+  function paintGhostEdges(anchors: [number, number][][]): void {
+    if (!ghost) return;
+    while (ghost.edgeEls.length < anchors.length) {
+      const p = document.createElementNS(SVG, "path");
+      p.setAttribute("fill", "none");
+      p.setAttribute("stroke", "rgba(37,99,235,0.45)");
+      p.setAttribute("stroke-width", "2");
+      p.setAttribute("stroke-dasharray", "5 4");
+      p.setAttribute("marker-end", "url(#ghost-arrow)");
+      p.style.pointerEvents = "none";
+      svg.appendChild(p);
+      ghost.edgeEls.push(p);
+    }
+    ghost.edgeEls.forEach((p, i) => {
+      if (i < anchors.length) { p.style.display = ""; p.setAttribute("d", bezierPath(anchors[i])); }
+      else p.style.display = "none";
+    });
+  }
+  function destroyGhost(): void {
+    if (!ghost) return;
+    ghost.view.destroy();
+    ghost.edgeEls.forEach(e => e.remove());
+    ghost = null;
+  }
+  // Reconcile the ghost with the current editor state, relaying out only when
+  // the structure it feeds actually changed (a same-height text edit just
+  // repaints the card text in place — see the height check).
+  function updateGhost(): void {
+    const wantGhost = editingNew && getSettings().showNewNodeInGraph.value === "on";
+    if (!wantGhost) { if (ghost) { destroyGhost(); relayout(); } return; }
+
+    const created = !ghost;
+    if (!ghost) {
+      const view = createNodeView(
+        { id: GHOST_ID, title: editorTitle.value || "New node", body: editorBody.value || undefined },
+        container, NODE_W,
+      );
+      view.setGhost(true);
+      ghost = { view, parents: [], children: [], edgeEls: [] };
+    }
+    const before = ghost.view.measure();
+    ghost.view.setContent(editorTitle.value || "New node", editorBody.value || undefined);
+    const heightChanged = ghost.view.measure() !== before;
+
+    const pc = ghostParentsChildren();
+    const linkChanged =
+      !arrEqUnordered(pc.parents, ghost.parents) || !arrEqUnordered(pc.children, ghost.children);
+    ghost.parents = pc.parents;
+    ghost.children = pc.children;
+
+    if (created || heightChanged || linkChanged) relayout();
   }
 
   // The pane's own keybinds — Ctrl+A/Ctrl+D/Ctrl+Enter/Esc, and Space's
@@ -1656,6 +1810,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     const newFullRankMap = computeRanks(fullGraph);
     const newMaxRank0 = Math.max(...fullGraph.nodes.map(n => newFullRankMap.get(n.id)!));
     if (newMaxRank0 > maxRank0) growRankPools(newMaxRank0);
+    if (ghost) {   // re-derive the ghost's links against the changed graph before laying out
+      const pc = ghostParentsChildren();
+      ghost.parents = pc.parents; ghost.children = pc.children;
+    }
     relayout();
   }
 

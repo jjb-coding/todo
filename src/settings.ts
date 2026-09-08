@@ -11,7 +11,7 @@
 
 import type { SettingIcon } from "./views/setting_icon";
 import {
-  selectOnCreateIcon, followSelectionIcon, edgeConflictIcon, nodeRightClickIcon,
+  selectOnCreateIcon, followSelectionIcon, edgeConflictIcon, nodeRightClickIcon, showNewNodeIcon,
 } from "./views/setting_icons";
 
 // how Left/Right scrolling follows the current selection.
@@ -49,6 +49,8 @@ export interface Settings {
   edgeConflictResolution: Setting<EdgeConflictMode>;
   // [4], see NodeRightClick above.
   nodeRightClick: Setting<NodeRightClick>;
+  // [5]: show the node currently being created as a translucent preview.
+  showNewNodeInGraph: Setting<OnOff>;
   // Startup-only: whether banks A/S/D start disabled, and whether the banks
   // icon group starts hidden. Never status-bar icons.
   bankADisabledByDefault: Setting<OnOff>;
@@ -65,6 +67,7 @@ const settings: Settings = {
     "block", ["block", "remove-parent", "remove-child"], "dag_view", edgeConflictIcon, true),
   nodeRightClick: setting<NodeRightClick>(
     "plain-deletes", ["plain-deletes", "shift-deletes"], "dag_view", nodeRightClickIcon, true),
+  showNewNodeInGraph: setting<OnOff>("on", ["on", "off"], "dag_view", showNewNodeIcon, true),
   bankADisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
   bankSDisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
   bankDDisabledByDefault: setting<OnOff>("off", ["off", "on"], "dag_view", null, false),
