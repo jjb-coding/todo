@@ -5,11 +5,18 @@
 //  setting through its enumerable states; right-click opens a menu of all
 //  states to pick from directly. It links straight into settings.ts and owns
 //  no setting logic of its own.
+//
+//  The whole group is rebuilt from scratch on every settings change (from
+//  here, the settings modal, or a cross-setting irrelevance effect) rather
+//  than patched incrementally — `showOnBar` itself can now change live from
+//  the modal, so the very set of rendered buttons can change, not just their
+//  painted state.
 // ============================================================================
 
-import { getSettings, advanceSetting, setSettingString } from "../settings";
+import { getSettings, advanceSetting, setSettingString, getIrrelevance, onSettingsChanged } from "../settings";
 import type { Settings, SettingCategory } from "../settings";
 import type { SettingIcon } from "./setting_icon";
+import { localise } from "../lang";
 
 export interface SettingsGroupView {
   readonly el: HTMLElement;
@@ -26,10 +33,7 @@ function onDocDown(ev: MouseEvent): void {
   if (activeMenu && !activeMenu.contains(ev.target as Node)) closeMenu();
 }
 
-function openMenu(
-  btn: HTMLElement, key: keyof Settings, icon: SettingIcon,
-  paint: () => void, notify: () => void,
-): void {
+function openMenu(btn: HTMLElement, key: keyof Settings, icon: SettingIcon): void {
   closeMenu();
   const s = getSettings()[key] as unknown as { value: string; states: readonly string[] };
   const menu = document.createElement("div");
@@ -40,7 +44,8 @@ function openMenu(
     item.className = "dag-setting-menu-item";
     item.textContent = icon.label(state);
     item.classList.toggle("current", state === s.value);
-    item.addEventListener("click", () => { setSettingString(key, state); paint(); notify(); closeMenu(); });
+    // setSettingString notifies -> the group (and the modal, if open) rebuild.
+    item.addEventListener("click", () => { setSettingString(key, state); closeMenu(); });
     menu.appendChild(item);
   });
   document.body.appendChild(menu);
@@ -52,32 +57,45 @@ function openMenu(
   setTimeout(() => document.addEventListener("mousedown", onDocDown, true), 0);
 }
 
-export function createSettingsGroup(
-  category: SettingCategory,
-  onChange?: (key: keyof Settings) => void,
-): SettingsGroupView {
+export function createSettingsGroup(category: SettingCategory): SettingsGroupView {
   const el = document.createElement("div");
   el.className = "dag-bargroup";
-  const S = getSettings();
-  const notify = (key: keyof Settings) => () => onChange?.(key);
 
-  (Object.keys(S) as (keyof Settings)[]).forEach(key => {
-    const s = S[key];
-    if (s.category !== category || !s.icon || !s.showOnBar) return;
-    const icon = s.icon;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "dag-settingbtn";
-    const paint = (): void => icon.render(btn, (getSettings()[key] as unknown as { value: string }).value);
-    paint();
-    btn.addEventListener("click", () => { advanceSetting(key); paint(); onChange?.(key); });
-    btn.addEventListener("contextmenu", ev => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      openMenu(btn, key, icon, paint, notify(key));
+  // A setting whose current value has no real effect (see settings.ts's
+  // getIrrelevance) still shows its state as a placeholder — greying it out
+  // is layered on via this wrapper span, entirely outside the icon's own
+  // render(), which each SettingIcon owns and repaints on its own terms.
+  function rebuild(): void {
+    el.innerHTML = "";
+    const S = getSettings();
+    (Object.keys(S) as (keyof Settings)[]).forEach(key => {
+      const s = S[key];
+      if (s.category !== category || !s.icon || !s.showOnBar) return;
+      const icon = s.icon;
+
+      const wrap = document.createElement("span");
+      wrap.className = "dag-setting-wrap";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "dag-settingbtn";
+      wrap.appendChild(btn);
+
+      icon.render(btn, s.value);
+      const irr = getIrrelevance(key);
+      wrap.classList.toggle("irrelevant", !!irr);
+      if (irr) btn.title = localise(irr.attributionKey);   // overrides the icon's own state tooltip
+
+      btn.addEventListener("click", () => advanceSetting(key));
+      btn.addEventListener("contextmenu", ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openMenu(btn, key, icon);
+      });
+      el.appendChild(wrap);
     });
-    el.appendChild(btn);
-  });
+  }
 
+  rebuild();
+  onSettingsChanged(rebuild);
   return { el };
 }

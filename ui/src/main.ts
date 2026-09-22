@@ -23,11 +23,12 @@ import {
   COL_W, H_PAD, NODE_W, MARGIN, LABEL_BAND,
 } from "./layout";
 import type { NodeSize, LayoutResult } from "./layout";
-import { getSettings } from "./settings";
+import { getSettings, onSettingsChanged } from "./settings";
 import { rgbStr, lerpCol, tintCol, NEUTRAL_COL } from "./colors";
 import { createNodeView } from "./views/node_view";
 import type { NodeView } from "./views/node_view";
 import { createSettingsGroup } from "./views/settings_group";
+import { createSettingsModal } from "./settings_modal";
 import { createLrIconView } from "./views/lr_icon_view";
 import { createUdIconView } from "./views/ud_icon_view";
 import { createSelIndicatorView } from "./views/sel_indicator_view";
@@ -116,8 +117,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
     container.appendChild(label);
     label.addEventListener("click", ev => {
       ev.stopPropagation();
+      const prevSig = selectionSignature();
       mode = "rank"; rankSel = r; selectedIds = []; subBuffer = "";
       refresh(); reveal();
+      blurPaneOnSelectionChange(prevSig);
     });
     rankLabels.push(label);
   }
@@ -791,8 +794,13 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function setBank(letter: BankLetter, sel: string[]): boolean {
     const ok = setBankRaw(letter, sel);
     if (ok) {
-      if (letter === "A") { editorUseA = !editorUseA; updateEditorFlags(); }
-      else if (letter === "D") { editorUseD = !editorUseD; updateEditorFlags(); }
+      // Mirrors Ctrl+A/Ctrl+D's *bind* half only, never its unbind/toggle
+      // half: this fires on every plain bank commit, so if the editor were
+      // already attached it would flip back off the moment its bank's
+      // membership merely changed. Only bind when nothing was attached yet.
+      if (letter === "A") { if (!editorUseA) { editorUseA = true; updateEditorFlags(); } }
+      else if (letter === "D") { if (!editorUseD) { editorUseD = true; updateEditorFlags(); } }
+      updateGhost();
     }
     return ok;
   }
@@ -837,8 +845,11 @@ function render(container: HTMLElement, initial: GraphDef): void {
     if (selMode === "edit" || prospective !== null || !sel.length) return;
     if (bankDisabled(letter)) return;
     if (toggleBankMembershipRaw(letter, sel)) {
-      if (letter === "A") { editorUseA = !editorUseA; updateEditorFlags(); }
-      else if (letter === "D") { editorUseD = !editorUseD; updateEditorFlags(); }
+      // As setBank: only ever binds an unattached editor connection, never
+      // unbinds an existing one just because membership shifted.
+      if (letter === "A") { if (!editorUseA) { editorUseA = true; updateEditorFlags(); } }
+      else if (letter === "D") { if (!editorUseD) { editorUseD = true; updateEditorFlags(); } }
+      updateGhost();
     }
   }
   // Enter, while a bank is armed: commit its selection, deselecting on success.
@@ -1005,7 +1016,10 @@ function render(container: HTMLElement, initial: GraphDef): void {
 
   // The settings icons + their click-cycle and right-click menus live entirely
   // in views/settings_group.ts, keyed off each setting's category.
-  const groupSettings = createSettingsGroup("dag_view", () => updateGhost()).el;
+  const groupSettings = createSettingsGroup("dag_view").el;
+  // Any dag_view setting change (icon bar, settings modal, or a cross-setting
+  // irrelevance effect) may affect the ghost preview (e.g. [5]) — resync it.
+  onSettingsChanged(() => updateGhost());
 
   bar.append(groupState, groupMode, groupBanks, groupEditing, groupSettings);
   panelFooter.appendChild(bar);
@@ -1599,8 +1613,8 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function ghostLayoutInput(): { edges: EdgeDef[] } | null {
     if (!ghost) return null;
     const parents = ghost.parents.filter(id => nodes.has(id) && included(id));
-    if (!parents.length) return null;
     const children = ghost.children.filter(id => nodes.has(id) && included(id));
+    if (!parents.length && !children.length) return null;
     return {
       edges: [
         ...parents.map(p => ({ from: p, to: GHOST_ID })),
@@ -1609,7 +1623,12 @@ function render(container: HTMLElement, initial: GraphDef): void {
     };
   }
   // Position the ghost + (re)draw its translucent edges. Runs at the end of
-  // every relayout.
+  // every relayout. With any parent or child, the ghost was folded into the
+  // real layout (see ghostLayoutInput/relayout) and sits at a real rank —
+  // children-only means rank 0, pushing every real descendant one column
+  // right, exactly as computeRanks would place any other new source node.
+  // Only a fully unattached draft falls back to floating at the viewport
+  // centre, since it has no edges to hang a rank off of at all.
   function paintGhost(): void {
     if (!ghost) return;
     const h = ghost.view.measure();
@@ -1617,27 +1636,17 @@ function render(container: HTMLElement, initial: GraphDef): void {
     let gx: number, gy: number;
 
     const layoutParents = ghost.parents.filter(id => nodes.has(id) && included(id));
-    if (layoutParents.length && lastLayout) {
+    const layoutChildren = ghost.children.filter(id => nodes.has(id) && included(id));
+    if ((layoutParents.length || layoutChildren.length) && lastLayout) {
       const pos = lastLayout.positions.get(GHOST_ID);
       if (!pos) { ghost.view.show(false); paintGhostEdges([]); return; }
       gx = pos.x; gy = pos.y;
       const push = (a?: [number, number][]) => { if (a) anchors.push(a); };
       layoutParents.forEach(p => push(lastLayout!.edgeAnchors.get(edgeKey({ from: p, to: GHOST_ID }))));
-      ghost.children.filter(id => nodes.has(id) && included(id))
-        .forEach(c => push(lastLayout!.edgeAnchors.get(edgeKey({ from: GHOST_ID, to: c }))));
+      layoutChildren.forEach(c => push(lastLayout!.edgeAnchors.get(edgeKey({ from: GHOST_ID, to: c }))));
     } else {
       gy = (canvasH - MARGIN + 6) - h / 2;   // centred on the bottom edge of the column band
-      const kids = ghost.children.filter(id => nodes.has(id) && included(id));
-      if (kids.length) {
-        const targetRank = Math.max(0, Math.min(...kids.map(c => nodes.get(c)!.rank)) - 1);
-        gx = colX(targetRank) + H_PAD;
-        kids.forEach(c => {
-          const ln = nodes.get(c)!;
-          anchors.push([[gx + NODE_W, gy + h / 2], [ln.x, ln.y + ln.height / 2]]);
-        });
-      } else {
-        gx = scrollCols * COL_W + viewportPx() / 2 - NODE_W / 2;   // viewport centre
-      }
+      gx = scrollCols * COL_W + viewportPx() / 2 - NODE_W / 2;   // viewport centre
     }
     ghost.view.moveTo(gx, gy);
     ghost.view.show(true);
@@ -1722,6 +1731,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       }
     }
     updateEditorFlags();
+    updateGhost();
   }
   // Ctrl+Shift+A/D (and Ctrl+Q for both): drop the editor's A/D connection,
   // whichever kind it is — turn off a real bank attach, or discard a transient
@@ -1733,6 +1743,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (bankDDisabled) boundD = null; else editorUseD = false;
     }
     paintBankBadges(); updateBar(); updateEditorFlags();
+    updateGhost();
   }
   // Ctrl+A/D in the editor: capture the current selection as the new node's
   // ancestor/descendant connection. An enabled bank is filled with it outright
@@ -1760,6 +1771,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       if (letter === "A") editorUseA = true; else editorUseD = true;
     }
     paintBankBadges(); updateBar(); updateEditorFlags();
+    updateGhost();
   }
   // The New Node editor's connection shortcuts — Ctrl+A/D bind the selection,
   // Ctrl+Shift+A/D unbind one, Ctrl+Q unbinds both. Shared so they fire whether
@@ -1926,10 +1938,29 @@ function render(container: HTMLElement, initial: GraphDef): void {
   // A function declaration (hoisted) so addNodeCard can wire a node up front,
   // before the rest of this section — which defines mode/selectedIds/etc — has
   // executed. The listeners themselves only run later, once those exist.
+  // A New/Existing editor field should only ever lose focus to a DAG-view
+  // mouse interaction that actually lands on a *different* selection — never
+  // to a click that leaves it unchanged (re-clicking the same node/rank), an
+  // edge click (never touches selection at all), or a background click
+  // (which always resolves to idle/empty, deliberately excluded below).
+  // Compare with handlePaneKeydown, which is the analogous keyboard story.
+  const selectionSignature = (): string => {
+    if (mode === "rank") return "rank:" + rankSel;
+    if (mode === "nodes" || mode === "subselect") return mode + ":" + selectedIds.slice().sort().join(",");
+    return "";
+  };
+  const blurPaneOnSelectionChange = (prevSig: string): void => {
+    const active = document.activeElement;
+    if (active !== editorTitle && active !== editorBody) return;
+    const sig = selectionSignature();
+    if (sig !== "" && sig !== prevSig) (active as HTMLElement).blur();
+  };
+
   function wireNode(ln: LaidNode): void {
     const id = ln.def.id;
     ln.el.addEventListener("click", ev => {
       ev.stopPropagation();
+      const prevSig = selectionSignature();
       // Edit mode: left-click is green/A, entirely independent of the
       // normal ancestor/descendant selection flow below.
       if (selMode === "edit") { editBankClick("A", id, ev.shiftKey); return; }
@@ -1950,6 +1981,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
       subBuffer = "";
       if (selectedIds.length) refresh();
       else { refresh(); applyFocus([id], HOVER, false); }            // deselected but still hovering
+      blurPaneOnSelectionChange(prevSig);
     });
     ln.el.addEventListener("mouseenter", () => {
       if (boxBtn !== -1 || edgeDragFrom !== null) return;            // mid box-sweep / edge-drag: no hover preview
@@ -2075,6 +2107,7 @@ function render(container: HTMLElement, initial: GraphDef): void {
   function finishBox(ev: MouseEvent): void {
     const [x1, y1] = boxLocalPt(ev);
     const hits = nodesInBox(x1, y1);
+    const prevSig = selectionSignature();
     if (hits.length) {
       if (selMode === "edit") {
         boxAddToBank(boxBtn === 0 ? "A" : boxBtn === 1 ? "S" : "D", hits);
@@ -2085,8 +2118,18 @@ function render(container: HTMLElement, initial: GraphDef): void {
       }
     }
     setActivePartition("dag", false);
+    blurPaneOnSelectionChange(prevSig);
   }
 
+  // Suppress the browser's default mousedown-elsewhere blur for every click
+  // in the DAG view (nodes, edges, rank labels, background alike — all live
+  // inside `container`) while a pane field is focused. Losing that focus is
+  // then a deliberate decision, made only by blurPaneOnSelectionChange once
+  // the click's actual effect on the selection is known.
+  container.addEventListener("mousedown", ev => {
+    const active = document.activeElement;
+    if (active === editorTitle || active === editorBody) ev.preventDefault();
+  });
   container.addEventListener("mousedown", ev => {
     if (!ev.shiftKey || boxBtn !== -1) return;
     if (ev.button !== 0 && ev.button !== 1 && ev.button !== 2) return;
@@ -2472,7 +2515,9 @@ function render(container: HTMLElement, initial: GraphDef): void {
     if (mode === "idle" && k === " ") { e.preventDefault(); selectRankNodes(0); return; }
   });
 
-  // Click on empty space returns to the default deselected state.
+  // Click on empty space returns to the default deselected state. Always
+  // resolves to idle, so it never blurs a focused pane field (see
+  // blurPaneOnSelectionChange) — deselecting isn't "picking something else".
   container.addEventListener("click", () => {
     if (mode !== "idle") { mode = "idle"; selectedIds = []; subBuffer = ""; refresh(); }
   });
@@ -2511,3 +2556,4 @@ const demo: GraphDef = {
 };
 
 render(document.getElementById("stage")!, demo);
+createSettingsModal();
